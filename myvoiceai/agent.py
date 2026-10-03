@@ -40,6 +40,7 @@ except Exception:
     trace = DummyTrace()
 
 logger = logging.getLogger("voice_agent")
+_AUDIO_UTTERANCE_END = object()
 
 async def _connect_deepgram(url: str, api_key: str | None):
     """Connect to a Deepgram websocket, tolerating both old and new
@@ -133,6 +134,7 @@ class CustomVoiceAgent:
         self._closing = False
         self._session_end_event = asyncio.Event()
         self._tts_flush_event = asyncio.Event()
+        self._playback_complete_event = asyncio.Event()
         self._tts_span_start_ns = None
         self._last_audio_sent_wall_ts = None
         self._any_output_sent = False
@@ -229,6 +231,7 @@ class CustomVoiceAgent:
                     if data.get("control") == "playback_complete":
                         self._last_activity_ts = time.monotonic()
                         self.is_ai_speaking = False
+                        self._playback_complete_event.set()
                         if self.is_welcome_message_running:
                             self.is_welcome_message_running = False
         except (WebSocketDisconnect, RuntimeError) as e:
@@ -617,11 +620,8 @@ class CustomVoiceAgent:
                     try:
                         data = json.loads(msg)
                         if data.get("type") == "Flushed":
+                            await self.audio_out_queue.put(_AUDIO_UTTERANCE_END)
                             self._tts_flush_event.set()
-                            try:
-                                await self.client_ws.send_json({"control": "utterance_end"})
-                            except Exception:
-                                pass
                             if self._current_turn_span:
                                 self._current_turn_span.end()
                                 self._current_turn_span = None
@@ -636,19 +636,23 @@ class CustomVoiceAgent:
     async def write_client_speaker_loop(self):
         while True:
             audio_payload = await self.audio_out_queue.get()
-            self._last_audio_out_ts = time.monotonic()
-            # self._last_activity_ts = self._last_audio_out_ts
-            if not self.interruption_event.is_set():
-                self.is_ai_speaking = True
-                try:
+            try:
+                if audio_payload is _AUDIO_UTTERANCE_END:
+                    await self.client_ws.send_json({"control": "utterance_end"})
+                    continue
+
+                self._last_audio_out_ts = time.monotonic()
+                if not self.interruption_event.is_set():
+                    self.is_ai_speaking = True
                     await self.client_ws.send_bytes(audio_payload)
-                except WebSocketDisconnect:
-                    logger.info("Client disconnected (speaker loop).")
-                    return
-                except RuntimeError:
-                    logger.info("Client websocket not ready or closed (speaker loop).")
-                    return
-            self.audio_out_queue.task_done()
+            except WebSocketDisconnect:
+                logger.info("Client disconnected (speaker loop).")
+                return
+            except RuntimeError:
+                logger.info("Client websocket not ready or closed (speaker loop).")
+                return
+            finally:
+                self.audio_out_queue.task_done()
 
     async def session_timer_loop(self):
         """Task 6: enforces a max session duration and an inactivity timeout,
@@ -674,6 +678,7 @@ class CustomVoiceAgent:
         through the pipeline and waits for it to finish playing."""
         self._closing = True
         self._tts_flush_event.clear()
+        self._playback_complete_event.clear()
         logger.info("Executing goodbye sequence: %r", text)
 
         self.interruption_event.set()
@@ -700,7 +705,22 @@ class CustomVoiceAgent:
         except asyncio.TimeoutError:
             logger.warning("Timed out waiting for Deepgram goodbye audio.")
 
-        await self.audio_out_queue.join()    
+        try:
+            await asyncio.wait_for(
+                self.audio_out_queue.join(),
+                timeout=DEFAULT_GOODBYE_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out sending goodbye audio to client.")
+
+        try:
+            await asyncio.wait_for(
+                self._playback_complete_event.wait(),
+                timeout=DEFAULT_GOODBYE_WAIT_SECONDS,
+            )
+            logger.info("Client finished playing goodbye audio.")
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for goodbye playback acknowledgement.")
 
         self._session_end_event.set()    
     
