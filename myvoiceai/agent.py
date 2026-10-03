@@ -10,28 +10,16 @@ from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
 from myvoiceai.utils.guardrails import check_input, check_output
 from myvoiceai.tools import get_default_registry, ToolRegistry
 import random
-from myvoiceai.lib.constants import SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL
+from myvoiceai.lib.constants import SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL, OTEL_EXPORTER_ENDPOINT
 import re
 from typing import cast
 import contextlib
 
 try:
-    from myvoiceai.lib.constants import OTEL_EXPORTER_ENDPOINT
     from opentelemetry import trace
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk.resources import Resource
     from opentelemetry.trace import StatusCode
-
-    resource = Resource.create({"service.name": "voice-agent"})
-    provider = TracerProvider(resource=resource)
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=OTEL_EXPORTER_ENDPOINT)))
-    trace.set_tracer_provider(provider)
-    tracer = trace.get_tracer("voice_agent")
 except Exception:
-    tracer = None
-    StatusCode = None  
+    StatusCode = None
     # Dummy trace module so trace.use_span() works when OTEL is absent
     class DummyTrace:
         def use_span(self, span, end_on_exit=False):
@@ -77,12 +65,11 @@ class CustomVoiceAgent:
         tool_registry: ToolRegistry,
         llm_provider_api_key: str | None = None,
         deepgram_api_key: str | None = None,
+        otel_exporter_endpoint: str | None = None,
+        otel_exporter_headers: dict[str, str] | None = None,
     ):
         self.client_ws = client_websocket
         self.tracing = tracing
-        self.tracer = tracer if tracing else None
-        if tracing and self.tracer is None:
-            logger.warning("tracing=True but opentelemetry is not installed; tracing disabled. Install using pip install myvoiceai[observability]")
         self.model = model
         self.llm_provider_api_key = llm_provider_api_key
         self.tool_registry = tool_registry 
@@ -94,6 +81,12 @@ class CustomVoiceAgent:
             raise RuntimeError(
                 "Pass the Deepgram API key."
             )
+
+        self._tracer_provider = None
+        self.tracer = self._initialize_tracer(
+            otel_exporter_endpoint,
+            otel_exporter_headers,
+        ) if tracing else None
 
         self.audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self.llm_prompt_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
@@ -150,6 +143,34 @@ class CustomVoiceAgent:
         self._stable_dispatch_ts = 0.0
 
         self._spoken_text_parts: list[str] = []
+
+    def _initialize_tracer(
+        self,
+        endpoint: str | None,
+        headers: dict[str, str] | None,
+    ):
+        try:
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+            resource = Resource.create({"service.name": "myvoiceai"})
+            provider = TracerProvider(resource=resource)
+            exporter = OTLPSpanExporter(
+                endpoint=endpoint or OTEL_EXPORTER_ENDPOINT,
+                headers=headers,
+            )
+            provider.add_span_processor(BatchSpanProcessor(exporter))
+            self._tracer_provider = provider
+            return provider.get_tracer("myvoiceai_tracer")
+        except Exception:
+            logger.warning(
+                "Tracing requested but OpenTelemetry SDK/exporter initialization failed; "
+                "install myvoiceai[observability] and check the endpoint configuration.",
+                exc_info=True,
+            )
+            return None
 
     async def run(self):
         """Orchestrates system loops and guarantees cleanup on exit,
@@ -208,6 +229,11 @@ class CustomVoiceAgent:
             await self.client_ws.close()
         except Exception:
             pass        
+        if self._tracer_provider is not None:
+            try:
+                await asyncio.to_thread(self._tracer_provider.shutdown)
+            except Exception:
+                logger.exception("Failed to shut down session tracer provider.")
         logger.info("Session cleaned up.")
 
     # adds audio to the audio_in_queue
@@ -961,6 +987,8 @@ async def run_voice_session(
     stt_model=DEEPGRAM_STT_MODEL,
     tts_model=DEEPGRAM_TTS_MODEL,
     tool_registry=get_default_registry(),
+    otel_exporter_endpoint=None,
+    otel_exporter_headers=None,
     **kwargs
 ):  
     if kwargs:
@@ -986,6 +1014,8 @@ async def run_voice_session(
             max_session_seconds=max_session_seconds,
             max_duration_message=max_duration_message,
             inactivity_message=inactivity_message,
+            otel_exporter_endpoint=otel_exporter_endpoint,
+            otel_exporter_headers=otel_exporter_headers,
             **kwargs,
         )
         await agent.run()

@@ -92,7 +92,11 @@ async def voice_session(websocket: WebSocket):
         llm_provider_api_key=GEMINI_API_KEY,
         deepgram_api_key=DEEPGRAM_API_KEY,
         session_id="test-001",
-        tracing=False,
+        tracing=True,
+        otel_exporter_endpoint=os.getenv("OTEL_EXPORTER_ENDPOINT"),
+        otel_exporter_headers={
+            "x-honeycomb-team": f"{os.getenv('OTEL_EXPORTER_API_KEY')}"
+        },
     )
 
 
@@ -100,7 +104,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("Starting Voice AI server...")
-    print("Access the docs at http://localhost:8000/docs")
-    print("Connect WebSocket clients to ws://localhost:8000/ws/voice")
+    print("Access the docs at http://localhost:8002/docs")
+    print("Connect WebSocket clients to ws://localhost:8002/ws/voice")
     
-    uvicorn.run("example.fastapi_app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("example.fastapi_app:app", host="0.0.0.0", port=8002, reload=True)

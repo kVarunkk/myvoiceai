@@ -1,8 +1,4 @@
-import os
-
-OTEL_EXPORTER_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces")
-# DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OTEL_EXPORTER_ENDPOINT="http://localhost:4318/v1/traces"
 DEEPGRAM_STT_MODEL="nova-2"
 DEEPGRAM_TTS_MODEL="aura-asteria-en"
 DEEPGRAM_STT_URL = (
