@@ -77,9 +77,15 @@ The example reads `GEMINI_API_KEY` and `DEEPGRAM_API_KEY` from environment varia
 | `stable_interim_secs_no_punct` | Delay for a stable interim without punctuation | `3.0` |
 | `tool_registry` | Registry of callable tools; omit to use the package default registry | Package default registry |
 | `tracing` | Enable OpenTelemetry spans for the session | `False` |
-| `otel_exporter_endpoint` | Full OTLP/HTTP traces endpoint | `http://localhost:4318/v1/traces` |
-| `otel_exporter_headers` | Optional exporter request headers as a string dictionary | `None` |
-| `session_id` | Identifier attached to session traces/logging | `New Session` |
+| `otel_exporters` | List of OTLP/HTTP exporter configurations (`endpoint` and optional `headers`) | `None` |
+| `service_name` | OpenTelemetry `service.name` resource attribute | `myvoiceai` |
+| `project_name` | OpenInference `openinference.project.name` resource attribute | `myvoiceai-voice-session` |
+| `service_version` | OpenTelemetry `service.version` resource attribute | `None` |
+| `deployment_environment` | Deployment environment resource attribute | `None` |
+| `session_id` | Identifier attached to session traces/logging; a UUID is generated when omitted | Generated UUID |
+| `eval_run_id` | Optional evaluation-run identifier attached to each turn span | `None` |
+| `eval_case_id` | Optional evaluation-case identifier attached to each turn span | `None` |
+| `eval_variant` | Optional prompt/model variant label attached to each turn span | `None` |
 
 `max_duration_message` and `inactivity_message` are also accepted by `run_voice_session()`. Unsupported extra keyword arguments are logged and ignored.
 
@@ -126,7 +132,7 @@ Tool implementations may be async callables. Tool schemas are supplied to LiteLL
 
 ## OpenTelemetry Tracing
 
-Tracing is optional. Install the extra and pass `tracing=True`. The endpoint and headers are passed to the session API, so configure them from trusted application settings:
+Tracing is optional. Install the extra and pass `tracing=True`. Exporter endpoints and headers are passed to the session API, so configure them from trusted application settings:
 
 ```python
 import os
@@ -136,14 +142,70 @@ await run_voice_session(
     llm_provider_api_key=os.environ["LLM_PROVIDER_API_KEY"],
     deepgram_api_key=os.environ["DEEPGRAM_API_KEY"],
     tracing=True,
-    otel_exporter_endpoint=os.environ["OTEL_EXPORTER_ENDPOINT"],
-    otel_exporter_headers={
-        "x-honeycomb-team": os.environ["OTEL_EXPORTER_API_KEY"],
-    },
+    service_name="travel-assistant",
+    project_name="travel-assistant-evals",
+    otel_exporters=[
+        {
+            "endpoint": os.environ["OTEL_EXPORTER_ENDPOINT"],
+            "headers": {
+                "x-honeycomb-team": os.environ["OTEL_EXPORTER_API_KEY"],
+            },
+        },
+    ],
 )
 ```
 
-Use the complete OTLP/HTTP traces URL supplied by your backend, including its path (commonly `/v1/traces`). The local default is `http://localhost:4318/v1/traces`; in a container, `localhost` refers to that container, so use a collector address reachable from the application. The package creates a provider for each traced session and shuts it down during session cleanup to flush spans. If the optional SDK/exporter cannot be initialized, tracing is disabled for that agent and a warning is logged.
+Use the complete OTLP/HTTP traces URL supplied by your backend, including its path (commonly `/v1/traces`). The package creates a provider for each traced session and shuts it down during session cleanup to flush spans. If `otel_exporters` is omitted or empty, spans are created but no exporter is registered. If the optional SDK/exporter cannot be initialized, tracing is disabled for that agent and a warning is logged.
+
+To send each session's spans to multiple OTLP/HTTP destinations, add one configuration dictionary per destination:
+
+```python
+await run_voice_session(
+    websocket=websocket,
+    tracing=True,
+    otel_exporters=[
+        {
+            "endpoint": os.environ["HONEYCOMB_OTEL_ENDPOINT"],
+            "headers": {
+                "x-honeycomb-team": os.environ["HONEYCOMB_API_KEY"],
+            },
+        },
+        {
+            "endpoint": os.environ["ARIZE_OTEL_ENDPOINT"],
+            "headers": {
+                "authorization": os.environ["ARIZE_API_KEY"],
+                "arize-space-id": os.environ["ARIZE_SPACE_ID"],
+                "arize-interface": "otel",
+            },
+        },
+    ],
+)
+```
+
+Each configuration must include an `endpoint` and may include `headers`. The package creates and manages the OTLP exporters internally, so application code does not need to import OpenTelemetry exporters. The `myvoiceai[observability]` extra is still required in the environment where tracing runs.
+
+Agent spans include OpenInference semantic attributes (`openinference.span.kind`, `input.value`, and `output.value` where applicable) so Arize can classify span types and display inputs/outputs. These attributes may contain conversation or tool data; review the data before exporting it to a tracing backend.
+
+`service_name` and `project_name` are resource attributes shared by all spans from a session. Set them to stable application and project identifiers to group traces consistently across sessions. `project_name` is distinct from Arize's Space ID, which remains an exporter header.
+
+`service_version` and `deployment_environment` add release and environment context to the resource. The package does not read these values from environment variables; pass them explicitly when calling `run_voice_session()`. If omitted, the corresponding resource attribute is omitted. For evaluation runs, pass `eval_run_id`, `eval_case_id`, and `eval_variant`; these are attached to each `voice_turn` span for filtering and comparison.
+
+### Breaking change in 0.0.9
+
+Version 0.0.9 removes the `otel_exporter_endpoint` and `otel_exporter_headers` arguments. Replace them with `otel_exporters`, a list of dictionaries with an `endpoint` and optional `headers`. For example, replace:
+
+```python
+otel_exporter_endpoint=endpoint,
+otel_exporter_headers=headers,
+```
+
+with:
+
+```python
+otel_exporters=[{"endpoint": endpoint, "headers": headers}],
+```
+
+There is no implicit localhost exporter in 0.0.9. If no configurations are supplied, no spans are exported.
 
 The repository contains local observability examples under `example/`:
 

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 import websockets
 from websockets.exceptions import ConnectionClosed
 from starlette.websockets import WebSocketDisconnect
@@ -10,10 +11,15 @@ from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
 from myvoiceai.utils.guardrails import check_input, check_output
 from myvoiceai.tools import get_default_registry, ToolRegistry
 import random
-from myvoiceai.lib.constants import SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL, OTEL_EXPORTER_ENDPOINT
+from myvoiceai.lib.constants import SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL
 import re
-from typing import cast
+from typing import NotRequired, Sequence, TypedDict, cast
 import contextlib
+
+
+class OTLPExporterConfig(TypedDict):
+    endpoint: str
+    headers: NotRequired[dict[str, str]]
 
 try:
     from opentelemetry import trace
@@ -61,19 +67,34 @@ class CustomVoiceAgent:
         stt_model: str,
         tts_model: str,
         tracing: bool,
-        session_id: str,
+        session_id: str | None,
         tool_registry: ToolRegistry,
         llm_provider_api_key: str | None = None,
         deepgram_api_key: str | None = None,
-        otel_exporter_endpoint: str | None = None,
-        otel_exporter_headers: dict[str, str] | None = None,
+        otel_exporters: Sequence[OTLPExporterConfig] | None = None,
+        service_name: str = "myvoiceai",
+        project_name: str = "myvoiceai-voice-session",
+        service_version: str | None = None,
+        deployment_environment: str | None = None,
+        eval_run_id: str | None = None,
+        eval_case_id: str | None = None,
+        eval_variant: str | None = None,
     ):
         self.client_ws = client_websocket
         self.tracing = tracing
         self.model = model
         self.llm_provider_api_key = llm_provider_api_key
         self.tool_registry = tool_registry 
-        self.session_id = session_id
+        self.session_id = session_id or str(uuid.uuid4())
+        self.eval_attributes = {
+            key: value
+            for key, value in (
+                ("eval.run_id", eval_run_id),
+                ("eval.case_id", eval_case_id),
+                ("eval.variant", eval_variant),
+            )
+            if value is not None
+        }
         self.deepgram_api_key = deepgram_api_key
         self.stt_model = stt_model
         self.tts_model = tts_model
@@ -83,10 +104,17 @@ class CustomVoiceAgent:
             )
 
         self._tracer_provider = None
-        self.tracer = self._initialize_tracer(
-            otel_exporter_endpoint,
-            otel_exporter_headers,
-        ) if tracing else None
+        self.tracer = (
+            self._initialize_tracer(
+                otel_exporters,
+                service_name,
+                project_name,
+                service_version,
+                deployment_environment,
+            )
+            if tracing
+            else None
+        )
 
         self.audio_in_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self.llm_prompt_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
@@ -146,8 +174,11 @@ class CustomVoiceAgent:
 
     def _initialize_tracer(
         self,
-        endpoint: str | None,
-        headers: dict[str, str] | None,
+        exporters_config: Sequence[OTLPExporterConfig] | None,
+        service_name: str,
+        project_name: str,
+        service_version: str | None,
+        deployment_environment: str | None,
     ):
         try:
             from opentelemetry.sdk.resources import Resource
@@ -155,13 +186,29 @@ class CustomVoiceAgent:
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
             from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
-            resource = Resource.create({"service.name": "myvoiceai"})
+            resource_attributes = {
+                "service.name": service_name,
+                "openinference.project.name": project_name,
+            }
+            if service_version:
+                resource_attributes["service.version"] = service_version
+            if deployment_environment:
+                resource_attributes["deployment.environment"] = deployment_environment
+            resource = Resource.create(resource_attributes)
             provider = TracerProvider(resource=resource)
-            exporter = OTLPSpanExporter(
-                endpoint=endpoint or OTEL_EXPORTER_ENDPOINT,
-                headers=headers,
-            )
-            provider.add_span_processor(BatchSpanProcessor(exporter))
+            for exporter_index, exporter_config in enumerate(exporters_config or (), start=1):
+                exporter_endpoint = exporter_config.get("endpoint")
+                if not exporter_endpoint:
+                    raise ValueError("Each OTLP exporter configuration needs an endpoint.")
+                exporter_headers = exporter_config.get("headers", {})
+                if not isinstance(exporter_headers, dict):
+                    raise TypeError("OTLP exporter headers must be a dictionary.")
+                logger.info("Initializing OTLP exporter %d.", exporter_index)
+                exporter = OTLPSpanExporter(
+                    endpoint=exporter_endpoint,
+                    headers=exporter_headers,
+                )
+                provider.add_span_processor(BatchSpanProcessor(exporter))
             self._tracer_provider = provider
             return provider.get_tracer("myvoiceai_tracer")
         except Exception:
@@ -318,14 +365,28 @@ class CustomVoiceAgent:
             if self.tracing and self.tracer:
                 self._current_turn_span = self.tracer.start_span(
                     "voice_turn",
-                    attributes={"turn.user_text": final_text, "turn.id": self.turn_counter + 1, "session.id": self.session_id or ""},
+                    attributes={
+                        "turn.user_text": final_text,
+                        "turn.id": self.turn_counter + 1,
+                        "session.id": self.session_id or "",
+                        "openinference.span.kind": "CHAIN",
+                        "input.value": final_text,
+                        **self.eval_attributes,
+                    },
                 )
             else:
                 self._current_turn_span = None
             
             with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
                 if self.tracing and self.tracer:
-                    stt_span = self.tracer.start_span("stt_finalize", start_time=turn_start_ns)
+                    stt_span = self.tracer.start_span(
+                        "stt_finalize",
+                        start_time=turn_start_ns,
+                        attributes={
+                            "openinference.span.kind": "CHAIN",
+                            "output.value": final_text,
+                        },
+                    )
                     stt_span.set_attribute("stt.source", source)
                     stt_span.end()
 
@@ -452,10 +513,21 @@ class CustomVoiceAgent:
 
             with (trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext()):
                 if self.tracing and self.tracer:
-                    with self.tracer.start_as_current_span("llm_stream", attributes={"llm.model": self.model}) as llm_span:
+                    with self.tracer.start_as_current_span(
+                        "llm_stream",
+                        attributes={
+                            "llm.model": self.model,
+                            "llm.model_name": self.model,
+                            "openinference.span.kind": "LLM",
+                            "input.value": prompt,
+                        },
+                    ) as llm_span:
                         full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
                 else:
                     full_reply = await self.llm_call(messages=messages, prompt=prompt)        
+
+            if self._current_turn_span and full_reply.strip():
+                self._current_turn_span.set_attribute("output.value", full_reply[:500])
                         
     
           
@@ -548,6 +620,9 @@ class CustomVoiceAgent:
 
     async def llm_call(self, messages, prompt, llm_span=None) -> str:
         full_reply = ""
+        if llm_span:
+            llm_span.set_attribute("openinference.span.kind", "LLM")
+            llm_span.set_attribute("input.value", prompt)
         try:
             current_messages = messages
             hop = 0
@@ -579,8 +654,9 @@ class CustomVoiceAgent:
                 current_messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
                 hop += 1
                 
-            if llm_span:    
+            if llm_span:
                 llm_span.set_attribute("llm.response_text", full_reply[:500])
+                llm_span.set_attribute("output.value", full_reply[:500])
             logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._gemini_request_ts or 0))
 
         except exceptions.APIError:
@@ -618,7 +694,14 @@ class CustomVoiceAgent:
                     if self._current_turn_span:
                         with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
                             if self.tracing and self.tracer:
-                                with self.tracer.start_as_current_span("tts_stream", attributes={"tts.text_len": len(item)}):
+                                with self.tracer.start_as_current_span(
+                                    "tts_stream",
+                                    attributes={
+                                        "tts.text_len": len(item),
+                                        "openinference.span.kind": "CHAIN",
+                                        "input.value": item,
+                                    },
+                                ):
                                     await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
                             else:
                                 await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
@@ -638,6 +721,7 @@ class CustomVoiceAgent:
                             with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
                                 if self.tracing and self.tracer:
                                     gen_span = self.tracer.start_span("tts_generation", start_time=self._tts_span_start_ns)
+                                    gen_span.set_attribute("openinference.span.kind", "CHAIN")
                                     gen_span.end()
                         self._tts_first_send_ts = None
                         self._tts_span_start_ns = None
@@ -816,10 +900,21 @@ class CustomVoiceAgent:
         if impl is None:
             return {"error": f"unknown tool: {name}"}
         if self.tracing and self.tracer:
-            with self.tracer.start_as_current_span("tool_call", attributes={"tool.name": name, "tool.args": json.dumps(args, default=str)}) as span:
+            serialized_args = json.dumps(args, default=str)
+            with self.tracer.start_as_current_span(
+                "tool_call",
+                attributes={
+                    "tool.name": name,
+                    "tool.args": serialized_args,
+                    "openinference.span.kind": "TOOL",
+                    "input.value": serialized_args,
+                },
+            ) as span:
                 try:
                     result = await impl(**args)
-                    span.set_attribute("tool.result", json.dumps(result, default=str)[:500])
+                    serialized_result = json.dumps(result, default=str)[:500]
+                    span.set_attribute("tool.result", serialized_result)
+                    span.set_attribute("output.value", serialized_result)
                     return result
                 except asyncio.CancelledError:
                     span.set_attribute("tool.cancelled", True)
@@ -982,13 +1077,19 @@ async def run_voice_session(
     model=LLM_MODEL,
     llm_provider_api_key=None,
     tracing=False,
-    session_id="New Session",
+    session_id: str | None = None,
     deepgram_api_key=None,
     stt_model=DEEPGRAM_STT_MODEL,
     tts_model=DEEPGRAM_TTS_MODEL,
     tool_registry=get_default_registry(),
-    otel_exporter_endpoint=None,
-    otel_exporter_headers=None,
+    otel_exporters: Sequence[OTLPExporterConfig] | None = None,
+    service_name: str = "myvoiceai",
+    project_name: str = "myvoiceai-voice-session",
+    service_version: str | None = None,
+    deployment_environment: str | None = None,
+    eval_run_id: str | None = None,
+    eval_case_id: str | None = None,
+    eval_variant: str | None = None,
     **kwargs
 ):  
     if kwargs:
@@ -1014,8 +1115,14 @@ async def run_voice_session(
             max_session_seconds=max_session_seconds,
             max_duration_message=max_duration_message,
             inactivity_message=inactivity_message,
-            otel_exporter_endpoint=otel_exporter_endpoint,
-            otel_exporter_headers=otel_exporter_headers,
+            otel_exporters=otel_exporters,
+            service_name=service_name,
+            project_name=project_name,
+            service_version=service_version,
+            deployment_environment=deployment_environment,
+            eval_run_id=eval_run_id,
+            eval_case_id=eval_case_id,
+            eval_variant=eval_variant,
             **kwargs,
         )
         await agent.run()

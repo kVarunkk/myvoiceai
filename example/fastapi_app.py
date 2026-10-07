@@ -74,10 +74,8 @@ async def voice_session(websocket: WebSocket):
     
     # Example system prompt
     system_prompt = "You are a travel assistant. You can look up flight information using the lookup_flight tool."
-    
     # Use the generic greeting
     greeting_message = "Hi there! I'm your travel assistant. "
-    
     # Run the voice session with custom tools
     await run_voice_session(
         websocket=websocket,
@@ -93,10 +91,26 @@ async def voice_session(websocket: WebSocket):
         deepgram_api_key=DEEPGRAM_API_KEY,
         session_id="test-001",
         tracing=True,
-        otel_exporter_endpoint=os.getenv("OTEL_EXPORTER_ENDPOINT"),
-        otel_exporter_headers={
-            "x-honeycomb-team": f"{os.getenv('OTEL_EXPORTER_API_KEY')}"
-        },
+        otel_exporters=[
+            {
+                "endpoint": os.getenv(
+                    "OTEL_EXPORTER_ENDPOINT",
+                    "http://localhost:4318/v1/traces",
+                ),
+                "headers": (
+                    {"x-honeycomb-team": os.environ["OTEL_EXPORTER_API_KEY"]}
+                    if os.getenv("OTEL_EXPORTER_API_KEY")
+                    else {}
+                ),
+            },
+            {
+                "endpoint": "https://otlp.arize.com/v1/traces",
+                "headers" : {
+                    "arize-api-key": os.environ["ARIZE_API_KEY"],
+                    "arize-space-id": os.environ["ARIZE_SPACE_ID"],
+                }
+            },
+        ],
     )
 
 
