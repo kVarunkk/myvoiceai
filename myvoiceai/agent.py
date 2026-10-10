@@ -1,20 +1,48 @@
 import asyncio
+import contextlib
 import json
 import logging
+import random
+import re
 import time
 import uuid
-import websockets
-from websockets.exceptions import ConnectionClosed
-from starlette.websockets import WebSocketDisconnect
-from litellm import acompletion, exceptions, CustomStreamWrapper
-from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
-from myvoiceai.utils.guardrails import check_input, check_output
-from myvoiceai.tools import get_default_registry, ToolRegistry
-import random
-from myvoiceai.lib.constants import SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL
-import re
 from typing import NotRequired, Sequence, TypedDict, cast
-import contextlib
+
+import websockets
+from litellm import CustomStreamWrapper, acompletion, exceptions
+from starlette.websockets import WebSocketDisconnect
+from websockets.exceptions import ConnectionClosed
+
+from myvoiceai.lib.constants import (
+    BASE_SYSTEM_PROMPT,
+    CLAUSE_BOUNDARY_CHARS,
+    DEEPGRAM_STT_MODEL,
+    DEEPGRAM_STT_URL,
+    DEEPGRAM_TTS_MODEL,
+    DEEPGRAM_TTS_URL,
+    DEFAULT_ENDPOINTING,
+    DEFAULT_GOODBYE_WAIT_SECONDS,
+    DEFAULT_GREETING_MESSAGE,
+    DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
+    DEFAULT_MAX_SESSION_SECONDS,
+    DEFAULT_UTTERANCE_END,
+    FILLERS,
+    GUARDRAIL_BLOCK_MESSAGE,
+    INACTIVITY_MESSAGE,
+    LLM_MODEL,
+    MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH,
+    MAX_DURATION_MESSAGE,
+    MAX_TOOL_HOPS,
+    SENTENCE_BOUNDARY_CHARS,
+    STABLE_INTERIM_NO_PUNCT_SECS,
+    STABLE_INTERIM_SECS,
+    SYSTEM_PROMPT,
+    TOOL_CALL_TIMEOUT_SECONDS,
+    TOOL_FILLER_PHRASES,
+)
+from myvoiceai.tools import ToolRegistry, get_default_registry
+from myvoiceai.utils.guardrails import check_input, check_output
+from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
 
 
 class OTLPExporterConfig(TypedDict):
@@ -29,7 +57,6 @@ except Exception:
     # Dummy trace module so trace.use_span() works when OTEL is absent
     class DummyTrace:
         def use_span(self, span, end_on_exit=False):
-            import contextlib
             return contextlib.nullcontext()
     trace = DummyTrace()
 
@@ -142,9 +169,8 @@ class CustomVoiceAgent:
 
         self._last_audio_sent_ts = None
         self._speech_final_ts = None
-        self._gemini_request_ts = None
+        self._llm_request_ts = None
         self._tts_first_send_ts = None
-        self._last_audio_out_ts = None
 
         self.max_session_seconds = max_session_seconds
         self.inactivity_timeout_seconds = inactivity_timeout_seconds
@@ -161,10 +187,8 @@ class CustomVoiceAgent:
         self._any_output_sent = False
 
         self.is_welcome_message_running = False
-        self._active_tool_task: list[asyncio.Task] | None = None
+        self._active_tool_tasks: list[asyncio.Task] | None = None
 
-
-        # in __init__
         self._interim_text = ""
         self._interim_since_ts = 0.0
         self._stable_words = []
@@ -233,7 +257,7 @@ class CustomVoiceAgent:
         ]
         try:
             await self._send_greeting()
-            done, pending = await asyncio.wait(
+            done, _ = await asyncio.wait(
                 self._tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -254,11 +278,11 @@ class CustomVoiceAgent:
             await self._shutdown()
 
     async def _shutdown(self):
-        if self._active_tool_task is not None:
-            for t in self._active_tool_task:
+        if self._active_tool_tasks is not None:
+            for t in self._active_tool_tasks:
                 if not t.done():
                     t.cancel()
-            self._active_tool_task = None
+            self._active_tool_tasks = None
 
 
         for task in self._tasks:
@@ -305,8 +329,7 @@ class CustomVoiceAgent:
                         self._last_activity_ts = time.monotonic()
                         self.is_ai_speaking = False
                         self._playback_complete_event.set()
-                        if self.is_welcome_message_running:
-                            self.is_welcome_message_running = False
+                        self.is_welcome_message_running = False
         except (WebSocketDisconnect, RuntimeError) as e:
             logger.info("Client connection ended (mic loop): %r", e)      
 
@@ -362,13 +385,13 @@ class CustomVoiceAgent:
                 pass
             self.transcript_accumulator = ""
             turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
-            if self.tracing and self.tracer:
+            if self.tracer:
                 self._current_turn_span = self.tracer.start_span(
                     "voice_turn",
                     attributes={
                         "turn.user_text": final_text,
                         "turn.id": self.turn_counter + 1,
-                        "session.id": self.session_id or "",
+                        "session.id": self.session_id,
                         "openinference.span.kind": "CHAIN",
                         "input.value": final_text,
                         **self.eval_attributes,
@@ -378,7 +401,7 @@ class CustomVoiceAgent:
                 self._current_turn_span = None
             
             with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
-                if self.tracing and self.tracer:
+                if self.tracer:
                     stt_span = self.tracer.start_span(
                         "stt_finalize",
                         start_time=turn_start_ns,
@@ -496,7 +519,7 @@ class CustomVoiceAgent:
     
             if self._speech_final_ts:
                 logger.info("Time from speech end to LLM dispatch: %.3fs", time.monotonic() - self._speech_final_ts)
-            self._gemini_request_ts = time.monotonic()
+            self._llm_request_ts = time.monotonic()
             self._tts_first_send_ts = None
             logger.info("Sending prompt to LLM: %r", prompt)
             self.sentence_buffer = ""
@@ -512,7 +535,7 @@ class CustomVoiceAgent:
             full_reply = ""
 
             with (trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext()):
-                if self.tracing and self.tracer:
+                if self.tracer:
                     with self.tracer.start_as_current_span(
                         "llm_stream",
                         attributes={
@@ -550,7 +573,7 @@ class CustomVoiceAgent:
             self.sentence_buffer = ""
     
             if full_reply.strip() and not self.interruption_event.is_set():
-                spoken = " ".join(self._spoken_text_parts).strip() or full_reply   # add
+                spoken = " ".join(self._spoken_text_parts).strip() or full_reply
                 self.conversation_history.append(
                     {"role": "assistant", "content": full_reply}
                 )
@@ -657,7 +680,7 @@ class CustomVoiceAgent:
             if llm_span:
                 llm_span.set_attribute("llm.response_text", full_reply[:500])
                 llm_span.set_attribute("output.value", full_reply[:500])
-            logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._gemini_request_ts or 0))
+            logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._llm_request_ts or 0))
 
         except exceptions.APIError:
             if llm_span:
@@ -692,8 +715,8 @@ class CustomVoiceAgent:
                         self._tts_first_send_ts = time.monotonic()
                         self._tts_span_start_ns = time.time_ns()
                     if self._current_turn_span:
-                        with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
-                            if self.tracing and self.tracer:
+                        with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracer else contextlib.nullcontext():
+                            if self.tracer:
                                 with self.tracer.start_as_current_span(
                                     "tts_stream",
                                     attributes={
@@ -708,7 +731,6 @@ class CustomVoiceAgent:
                     else:
                         await tts_ws.send(json.dumps({"type": "Speak", "text": item}))    
                     logger.info("Sending text to Deepgram TTS at t=%.3f: %r", time.monotonic(), item)
-                    # await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
                 self.tts_text_queue.task_done()
 
         async def harvest_audio_from_tts():
@@ -718,8 +740,8 @@ class CustomVoiceAgent:
                     if self._tts_first_send_ts is not None:
                         logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
                         if self._current_turn_span and self._tts_span_start_ns:
-                            with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
-                                if self.tracing and self.tracer:
+                            with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracer else contextlib.nullcontext():
+                                if self.tracer:
                                     gen_span = self.tracer.start_span("tts_generation", start_time=self._tts_span_start_ns)
                                     gen_span.set_attribute("openinference.span.kind", "CHAIN")
                                     gen_span.end()
@@ -751,7 +773,6 @@ class CustomVoiceAgent:
                     await self.client_ws.send_json({"control": "utterance_end"})
                     continue
 
-                self._last_audio_out_ts = time.monotonic()
                 if not self.interruption_event.is_set():
                     self.is_ai_speaking = True
                     await self.client_ws.send_bytes(audio_payload)
@@ -845,11 +866,11 @@ class CustomVoiceAgent:
             self._current_turn_span.end()
             self._current_turn_span = None
 
-        if self._active_tool_task is not None:
-            for t in self._active_tool_task:
+        if self._active_tool_tasks is not None:
+            for t in self._active_tool_tasks:
                 if not t.done():
                     t.cancel()
-            self._active_tool_task = None    
+            self._active_tool_tasks = None    
 
         for q in (self.llm_prompt_queue, self.tts_text_queue, self.audio_out_queue):
             while not q.empty():
@@ -899,7 +920,7 @@ class CustomVoiceAgent:
         impl = self.tool_registry.lookup(name)
         if impl is None:
             return {"error": f"unknown tool: {name}"}
-        if self.tracing and self.tracer:
+        if self.tracer:
             serialized_args = json.dumps(args, default=str)
             with self.tracer.start_as_current_span(
                 "tool_call",
@@ -947,7 +968,6 @@ class CustomVoiceAgent:
             timeout=30.0,
             api_key=self.llm_provider_api_key,
             tools=self.tool_registry.schemas() or None,
-            # tool_choice="auto",
         ))
 
         async for chunk in response:
@@ -962,7 +982,7 @@ class CustomVoiceAgent:
             if text_token:
                 reply += text_token
                 if not first_token_logged:
-                    logger.info("LLM time to first token: %.3fs", time.monotonic() - (self._gemini_request_ts or 0.0))
+                    logger.info("LLM time to first token: %.3fs", time.monotonic() - (self._llm_request_ts or 0.0))
                     first_token_logged = True
                 await self._buffer_and_dispatch(text_token)
 
@@ -1017,12 +1037,12 @@ class CustomVoiceAgent:
             asyncio.create_task(self._run_tool_call(entry["name"], args))
             for entry, args in zip(entries, parsed_args)
         ]
-        self._active_tool_task = tool_tasks  # now a list, shared cancellation handle
+        self._active_tool_tasks = tool_tasks
 
         tools_group = asyncio.gather(*tool_tasks, return_exceptions=True)
         interrupt_wait_task = asyncio.create_task(self.interruption_event.wait())
 
-        done, pending = await asyncio.wait(
+        done, _ = await asyncio.wait(
             [tools_group, interrupt_wait_task],
             timeout=TOOL_CALL_TIMEOUT_SECONDS,
             return_when=asyncio.FIRST_COMPLETED,
@@ -1035,7 +1055,7 @@ class CustomVoiceAgent:
             for t in tool_tasks:
                 if not t.done():
                     t.cancel()
-            self._active_tool_task = None
+            self._active_tool_tasks = None
             if interrupt_wait_task not in done:
                 await self.tts_text_queue.put(
                     strip_markdown_for_speech("That's taking longer than expected, let me get back to you.")
@@ -1043,7 +1063,7 @@ class CustomVoiceAgent:
                 await self.tts_text_queue.put({"flush": True})
             return False
 
-        self._active_tool_task = None
+        self._active_tool_tasks = None
 
         if self.interruption_event.is_set():
             return False
