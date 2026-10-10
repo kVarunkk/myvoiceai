@@ -129,7 +129,8 @@ def tool_call_chunk(index, call_id, name, arguments):
 
 
 class FakeLLM:
-    """Replaces litellm.acompletion. Each call pops the next scripted list of chunks."""
+    """Replaces litellm.acompletion. Each call pops the next scripted list of
+    chunks, or raises it if the script is an exception."""
 
     def __init__(self, *scripts):
         self.scripts = list(scripts)
@@ -138,6 +139,8 @@ class FakeLLM:
     async def __call__(self, **kwargs):
         self.calls.append(json.loads(json.dumps(kwargs["messages"], default=str)))
         chunks = self.scripts.pop(0)
+        if isinstance(chunks, Exception):
+            raise chunks
 
         async def gen():
             for c in chunks:
@@ -370,6 +373,25 @@ class ConversationTurnTests(PipelineTestCase):
             [GREETING, "FLUSH", "Sure thing", "FLUSH"],
         )
         self.assertEqual(self.client.json_of("transcript")[-1]["text"], "Sure thing")
+        await self.end_session()
+
+
+class LLMErrorTests(PipelineTestCase):
+    async def test_llm_error_speaks_block_message_and_next_turn_still_works(self):
+        llm = FakeLLM(RuntimeError("provider down"), [text_chunk("Back now.")])
+        await self.start_session(llm)
+
+        await self.user_says("hello")
+        await wait_until(lambda: GUARDRAIL_BLOCK_MESSAGE in self.tts.spoken, msg="block message")
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.tts.spoken, [GREETING, "FLUSH", GUARDRAIL_BLOCK_MESSAGE, "FLUSH"])
+        self.assertEqual(self.agent.conversation_history, [{"role": "user", "content": "hello"}])
+        self.assertEqual(self.client.json_of("turn"), [])
+
+        await self.user_says("again")
+        await self.wait_turn_done(1)
+        self.assertEqual(self.tts.spoken[-3:], ["Back now.", "FLUSH", "FLUSH"])
         await self.end_session()
 
 
@@ -635,6 +657,26 @@ class TracingSpanTests(PipelineTestCase):
                 }),
             ],
         )
+
+    async def test_llm_error_marks_llm_span(self):
+        from opentelemetry.trace import StatusCode
+
+        await self.start_traced_session(FakeLLM(RuntimeError("provider down")))
+        await self.user_says("hello")
+        await wait_until(lambda: GUARDRAIL_BLOCK_MESSAGE in self.tts.spoken, msg="block message")
+        await asyncio.sleep(0.05)
+        await self.end_session()
+
+        llm_span = [s for s in self.exporter.get_finished_spans() if s.name == "llm_stream"][0]
+        self.assertEqual(llm_span.status.status_code, StatusCode.ERROR)
+        self.assertEqual([ev.name for ev in llm_span.events], ["exception"])
+        self.assertEqual(llm_span.events[0].attributes["exception.message"], "provider down")
+        self.assertEqual(dict(llm_span.attributes), {
+            "llm.model": "mock-model",
+            "llm.model_name": "mock-model",
+            "openinference.span.kind": "LLM",
+            "input.value": "hello",
+        })
 
     async def test_tool_and_guardrail_spans(self):
         async def ping():
