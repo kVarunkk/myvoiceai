@@ -7,3 +7,6 @@ plan
 dist
 myvoiceai.egg-info
 test_pypi_env
+REFACTOR_PLAN.md
+.claude
+.pytest_cache

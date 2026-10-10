@@ -15,14 +15,17 @@ DEEPGRAM_TTS_URL = (
     "?encoding=linear16&sample_rate=16000&model={tts_model}"
 )
 LLM_MODEL = "gemini/gemini-2.5-flash"
+LLM_REQUEST_TIMEOUT_SECONDS = 30.0
 
 SENTENCE_BOUNDARY_CHARS = {".", "!", "?", "\n"}
 CLAUSE_BOUNDARY_CHARS = {",", ";", ":"}
 MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH = 100
+MIN_CHARS_BEFORE_CLAUSE_FLUSH = 40  # a clause boundary only ends a TTS chunk past this many chars
 
 DEFAULT_MAX_SESSION_SECONDS = 300          
 DEFAULT_INACTIVITY_TIMEOUT_SECONDS = 10    
 DEFAULT_GOODBYE_WAIT_SECONDS = 10 
+GOODBYE_TTS_GRACE_SECONDS = 0.3  # let TTS start on the goodbye before waiting on it
 
 DEFAULT_GREETING_MESSAGE = "Hi there! How can I help you today?"
 
@@ -48,5 +51,9 @@ DEFAULT_ENDPOINTING = 1200
 DEFAULT_UTTERANCE_END = 2500
 STABLE_INTERIM_SECS = 1.5
 STABLE_INTERIM_NO_PUNCT_SECS = 3.0
+STABLE_INTERIM_POLL_SECS = 0.05
+STABLE_DISPATCH_DEDUP_SECS = 5  # window for dropping words already sent via a stable interim
 
 FILLERS = {"and", "uh", "um", "so", "but", "or", "the", "a", "like"}
+
+TRACE_TEXT_MAX_CHARS = 500  # longest text recorded on a span attribute

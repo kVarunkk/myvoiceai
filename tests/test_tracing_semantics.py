@@ -147,7 +147,7 @@ class LLMTracingSemanticsTests(unittest.TestCase):
 
         agent = MockVoiceAgent.__new__(MockVoiceAgent)
         agent.interruption_event = asyncio.Event()
-        agent._gemini_request_ts = None
+        agent._llm_request_ts = None
 
         async def invoke_llm():
             with tracer.start_as_current_span(

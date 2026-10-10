@@ -1,37 +1,55 @@
 import asyncio
+import contextlib
 import json
 import logging
+import random
+import re
 import time
 import uuid
+from typing import Sequence, cast
+
 import websockets
-from websockets.exceptions import ConnectionClosed
+from litellm import CustomStreamWrapper, acompletion, exceptions
 from starlette.websockets import WebSocketDisconnect
-from litellm import acompletion, exceptions, CustomStreamWrapper
-from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
+from websockets.exceptions import ConnectionClosed
+
+from myvoiceai.lib.constants import (
+    BASE_SYSTEM_PROMPT,
+    CLAUSE_BOUNDARY_CHARS,
+    DEEPGRAM_STT_MODEL,
+    DEEPGRAM_STT_URL,
+    DEEPGRAM_TTS_MODEL,
+    DEEPGRAM_TTS_URL,
+    DEFAULT_ENDPOINTING,
+    DEFAULT_GOODBYE_WAIT_SECONDS,
+    DEFAULT_GREETING_MESSAGE,
+    DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
+    DEFAULT_MAX_SESSION_SECONDS,
+    DEFAULT_UTTERANCE_END,
+    FILLERS,
+    GOODBYE_TTS_GRACE_SECONDS,
+    GUARDRAIL_BLOCK_MESSAGE,
+    INACTIVITY_MESSAGE,
+    LLM_MODEL,
+    LLM_REQUEST_TIMEOUT_SECONDS,
+    MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH,
+    MAX_DURATION_MESSAGE,
+    MAX_TOOL_HOPS,
+    MIN_CHARS_BEFORE_CLAUSE_FLUSH,
+    SENTENCE_BOUNDARY_CHARS,
+    STABLE_DISPATCH_DEDUP_SECS,
+    STABLE_INTERIM_NO_PUNCT_SECS,
+    STABLE_INTERIM_POLL_SECS,
+    STABLE_INTERIM_SECS,
+    SYSTEM_PROMPT,
+    TOOL_CALL_TIMEOUT_SECONDS,
+    TOOL_FILLER_PHRASES,
+    TRACE_TEXT_MAX_CHARS,
+)
+from myvoiceai.tools import ToolRegistry, get_default_registry
+from myvoiceai.tracing import OTLPExporterConfig, create_tracer_provider, mark_span_error, trace
 from myvoiceai.utils.guardrails import check_input, check_output
-from myvoiceai.tools import get_default_registry, ToolRegistry
-import random
-from myvoiceai.lib.constants import SYSTEM_PROMPT, DEFAULT_MAX_SESSION_SECONDS, DEFAULT_INACTIVITY_TIMEOUT_SECONDS, DEFAULT_GREETING_MESSAGE, BASE_SYSTEM_PROMPT, DEEPGRAM_STT_URL, LLM_MODEL, SENTENCE_BOUNDARY_CHARS, CLAUSE_BOUNDARY_CHARS, MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH, DEEPGRAM_TTS_URL, GUARDRAIL_BLOCK_MESSAGE, DEFAULT_GOODBYE_WAIT_SECONDS, INACTIVITY_MESSAGE, MAX_DURATION_MESSAGE, MAX_TOOL_HOPS, TOOL_CALL_TIMEOUT_SECONDS, TOOL_FILLER_PHRASES, STABLE_INTERIM_SECS, STABLE_INTERIM_NO_PUNCT_SECS, FILLERS, DEFAULT_ENDPOINTING, DEFAULT_UTTERANCE_END, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL
-import re
-from typing import NotRequired, Sequence, TypedDict, cast
-import contextlib
-
-
-class OTLPExporterConfig(TypedDict):
-    endpoint: str
-    headers: NotRequired[dict[str, str]]
-
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode
-except Exception:
-    StatusCode = None
-    # Dummy trace module so trace.use_span() works when OTEL is absent
-    class DummyTrace:
-        def use_span(self, span, end_on_exit=False):
-            import contextlib
-            return contextlib.nullcontext()
-    trace = DummyTrace()
+from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
 
 logger = logging.getLogger("voice_agent")
 _AUDIO_UTTERANCE_END = object()
@@ -45,6 +63,7 @@ async def _connect_deepgram(url: str, api_key: str | None):
         return await websockets.connect(url, additional_headers=headers)
     except TypeError:
         return await websockets.connect(url, extra_headers=headers)
+
 
 def _words(s: str) -> list[str]:
     return re.sub(r"[^\w\s']", "", s).lower().split()
@@ -142,9 +161,8 @@ class CustomVoiceAgent:
 
         self._last_audio_sent_ts = None
         self._speech_final_ts = None
-        self._gemini_request_ts = None
+        self._llm_request_ts = None
         self._tts_first_send_ts = None
-        self._last_audio_out_ts = None
 
         self.max_session_seconds = max_session_seconds
         self.inactivity_timeout_seconds = inactivity_timeout_seconds
@@ -161,10 +179,8 @@ class CustomVoiceAgent:
         self._any_output_sent = False
 
         self.is_welcome_message_running = False
-        self._active_tool_task: list[asyncio.Task] | None = None
+        self._active_tool_tasks: list[asyncio.Task] | None = None
 
-
-        # in __init__
         self._interim_text = ""
         self._interim_since_ts = 0.0
         self._stable_words = []
@@ -180,44 +196,16 @@ class CustomVoiceAgent:
         service_version: str | None,
         deployment_environment: str | None,
     ):
-        try:
-            from opentelemetry.sdk.resources import Resource
-            from opentelemetry.sdk.trace import TracerProvider
-            from opentelemetry.sdk.trace.export import BatchSpanProcessor
-            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-
-            resource_attributes = {
-                "service.name": service_name,
-                "openinference.project.name": project_name,
-            }
-            if service_version:
-                resource_attributes["service.version"] = service_version
-            if deployment_environment:
-                resource_attributes["deployment.environment"] = deployment_environment
-            resource = Resource.create(resource_attributes)
-            provider = TracerProvider(resource=resource)
-            for exporter_index, exporter_config in enumerate(exporters_config or (), start=1):
-                exporter_endpoint = exporter_config.get("endpoint")
-                if not exporter_endpoint:
-                    raise ValueError("Each OTLP exporter configuration needs an endpoint.")
-                exporter_headers = exporter_config.get("headers", {})
-                if not isinstance(exporter_headers, dict):
-                    raise TypeError("OTLP exporter headers must be a dictionary.")
-                logger.info("Initializing OTLP exporter %d.", exporter_index)
-                exporter = OTLPSpanExporter(
-                    endpoint=exporter_endpoint,
-                    headers=exporter_headers,
-                )
-                provider.add_span_processor(BatchSpanProcessor(exporter))
-            self._tracer_provider = provider
-            return provider.get_tracer("myvoiceai_tracer")
-        except Exception:
-            logger.warning(
-                "Tracing requested but OpenTelemetry SDK/exporter initialization failed; "
-                "install myvoiceai[observability] and check the endpoint configuration.",
-                exc_info=True,
-            )
+        self._tracer_provider = create_tracer_provider(
+            exporters_config,
+            service_name,
+            project_name,
+            service_version,
+            deployment_environment,
+        )
+        if self._tracer_provider is None:
             return None
+        return self._tracer_provider.get_tracer("myvoiceai_tracer")
 
     async def run(self):
         """Orchestrates system loops and guarantees cleanup on exit,
@@ -233,7 +221,7 @@ class CustomVoiceAgent:
         ]
         try:
             await self._send_greeting()
-            done, pending = await asyncio.wait(
+            done, _ = await asyncio.wait(
                 self._tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -254,12 +242,7 @@ class CustomVoiceAgent:
             await self._shutdown()
 
     async def _shutdown(self):
-        if self._active_tool_task is not None:
-            for t in self._active_tool_task:
-                if not t.done():
-                    t.cancel()
-            self._active_tool_task = None
-
+        self._cancel_tool_tasks()
 
         for task in self._tasks:
             if not task.done():
@@ -305,8 +288,7 @@ class CustomVoiceAgent:
                         self._last_activity_ts = time.monotonic()
                         self.is_ai_speaking = False
                         self._playback_complete_event.set()
-                        if self.is_welcome_message_running:
-                            self.is_welcome_message_running = False
+                        self.is_welcome_message_running = False
         except (WebSocketDisconnect, RuntimeError) as e:
             logger.info("Client connection ended (mic loop): %r", e)      
 
@@ -318,169 +300,158 @@ class CustomVoiceAgent:
         dg_ws = self._dg_stt_ws
         logger.info("Connected to Deepgram STT.")
 
-        async def stable_interim_watcher():
-            while True:
-                await asyncio.sleep(0.05)
-                t = self._interim_text
-                if not t:
-                    continue
-                punct = t.rstrip().endswith((".", "?", "!"))
-                if not punct and len(_words(t)) < 3:
-                    continue  # fragment like "and"; wait for speech_final / UtteranceEnd
-                needed = self.stable_interim_secs if punct else self.stable_interim_secs_no_punct
-                if time.monotonic() - self._interim_since_ts >= needed:
-                    logger.info("Interim stable for >%.1fs, dispatching: %r", needed, t)
-                    self._stable_words = _words(t)
-                    self._stable_dispatch_ts = time.monotonic()
-                    self.transcript_accumulator += f" {t}"
-                    self._interim_text = ""
-                    await dispatch_final_transcript("stable_interim")
-    
-        async def forward_audio_to_dg():
-            while True:
-                chunk = await self.audio_in_queue.get()
-                await dg_ws.send(chunk)
-                self._last_audio_sent_ts = time.monotonic()
-                self._last_audio_sent_wall_ts = time.time_ns()
-                self.audio_in_queue.task_done()
-    
-        async def dispatch_final_transcript(source: str):
-            if not self.transcript_accumulator.strip():
-                return
-            self._last_activity_ts = time.monotonic()
-            final_text = self.transcript_accumulator.strip()
-            if self._last_audio_sent_ts:
-                logger.info(
-                    "STT time (last audio to %s): %.3fs",
-                    source, time.monotonic() - self._last_audio_sent_ts
-                )
-            self._speech_final_ts = time.monotonic()
-            logger.info("User: %s", final_text)
-            try:
-                await self.client_ws.send_json({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
-            except Exception:
-                pass
-            self.transcript_accumulator = ""
-            turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
-            if self.tracing and self.tracer:
-                self._current_turn_span = self.tracer.start_span(
-                    "voice_turn",
-                    attributes={
-                        "turn.user_text": final_text,
-                        "turn.id": self.turn_counter + 1,
-                        "session.id": self.session_id or "",
-                        "openinference.span.kind": "CHAIN",
-                        "input.value": final_text,
-                        **self.eval_attributes,
-                    },
-                )
-            else:
-                self._current_turn_span = None
-            
-            with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
-                if self.tracing and self.tracer:
-                    stt_span = self.tracer.start_span(
-                        "stt_finalize",
-                        start_time=turn_start_ns,
-                        attributes={
-                            "openinference.span.kind": "CHAIN",
-                            "output.value": final_text,
-                        },
-                    )
-                    stt_span.set_attribute("stt.source", source)
-                    stt_span.end()
-
-            result = await check_input(final_text)
-            if self._current_turn_span:
-                self._current_turn_span.set_attribute("guardrail.input_allowed", result.allowed)
-            if not result.allowed:
-                if self._current_turn_span:
-                    self._current_turn_span.set_attribute("guardrail.input_reason", result.reason or "")
-                    self._current_turn_span.end()
-                    self._current_turn_span = None
-                await self._speak_guardrail_block()
-                return
-            
-            await self.llm_prompt_queue.put(final_text)
-
-        def strip_dispatched(text: str) -> str:
-            """Drop the part of `text` that was already sent via the stable interim path."""
-            if not self._stable_words or time.monotonic() - self._stable_dispatch_ts > 5:
-                return text
-            n = len(self._stable_words)
-            if _words(text)[:n] == self._stable_words:
-                return " ".join(text.split()[n:])
-            return text    
-    
-        async def handle_dg_responses():
-            while True:
-                try:
-                    msg = await dg_ws.recv()
-                    data = json.loads(msg)
-                except json.JSONDecodeError:
-                    logger.warning("Non-JSON message from Deepgram, skipping.")
-                    continue
-    
-                msg_type = data.get("type")
-    
-                if msg_type == "UtteranceEnd":
-                    logger.info("UtteranceEnd received.")
-                    if self._interim_text and time.monotonic() - self._interim_since_ts < self.stable_interim_secs_no_punct:
-                        # Deepgram still has an unfinalized interim; wait for its final
-                        continue
-                    await dispatch_final_transcript("UtteranceEnd")
-                    self._stable_words = []
-                    self._interim_text = ""
-                    continue
-    
-                if msg_type == "Results":
-                    alt = data.get("channel", {}).get("alternatives", [{}])[0]
-                    transcript = alt.get("transcript", "")
-    
-                    if transcript:
-                        try:
-                            await self.client_ws.send_json({
-                                "transcript_chunk": {
-                                    "role": "user",
-                                    "turn_id": self.turn_counter + 1,
-                                    "text": f"{self.transcript_accumulator} {self._interim_text}".strip(),
-                                    "replace": True,
-                                }
-                            })
-                        except Exception:
-                            pass
-                        self._last_activity_ts = time.monotonic()
-                        tail = strip_dispatched(transcript)
-                        new_words = [w for w in _words(tail) if w not in FILLERS]
-
-                        logger.info("Interim transcript fragment: %r (is_final=%s) (speech_final=%s)", transcript, data.get("is_final"), data.get("speech_final"))
-
-                        if self.is_ai_speaking and not self.interruption_event.is_set() and not self._closing and not self.is_welcome_message_running and new_words:
-                            logger.info("Barge-in detected via transcript: %r", transcript)
-                            if self._current_turn_span:
-                                self._current_turn_span.set_attribute("turn.interrupted_by_barge_in", True)
-                            self.interruption_event.set()
-                            self.transcript_accumulator = ""
-                            await self._purge_pipeline()
-    
-                        if data.get("is_final"):
-                            if tail.strip():
-                                self.transcript_accumulator += f" {tail}"
-                            self._interim_text = ""
-                        elif tail.strip() and tail != self._interim_text:
-                            self._interim_text = tail
-                            self._interim_since_ts = time.monotonic()
-    
-                    if data.get("speech_final"):
-                        await dispatch_final_transcript("speech_final")
-    
         try:
-            await asyncio.gather(forward_audio_to_dg(), handle_dg_responses(), stable_interim_watcher())
+            await asyncio.gather(
+                self._stt_forward_audio(dg_ws),
+                self._stt_handle_responses(dg_ws),
+                self._stt_stable_interim_watcher(),
+            )
         except ConnectionClosed:
-            if self._current_turn_span and StatusCode:
-                self._current_turn_span.set_status(StatusCode.ERROR)
+            if self._current_turn_span:
+                mark_span_error(self._current_turn_span)
                 self._current_turn_span.set_attribute("error.source", "deepgram_stt")
             logger.warning("Deepgram STT connection closed.")
+
+    async def _stt_stable_interim_watcher(self):
+        while True:
+            await asyncio.sleep(STABLE_INTERIM_POLL_SECS)
+            t = self._interim_text
+            if not t:
+                continue
+            punct = t.rstrip().endswith((".", "?", "!"))
+            if not punct and len(_words(t)) < 3:
+                continue  # fragment like "and"; wait for speech_final / UtteranceEnd
+            needed = self.stable_interim_secs if punct else self.stable_interim_secs_no_punct
+            if time.monotonic() - self._interim_since_ts >= needed:
+                logger.info("Interim stable for >%.1fs, dispatching: %r", needed, t)
+                self._stable_words = _words(t)
+                self._stable_dispatch_ts = time.monotonic()
+                self.transcript_accumulator += f" {t}"
+                self._interim_text = ""
+                await self._dispatch_final_transcript("stable_interim")
+
+    async def _stt_forward_audio(self, dg_ws):
+        while True:
+            chunk = await self.audio_in_queue.get()
+            await dg_ws.send(chunk)
+            self._last_audio_sent_ts = time.monotonic()
+            self._last_audio_sent_wall_ts = time.time_ns()
+            self.audio_in_queue.task_done()
+
+    async def _dispatch_final_transcript(self, source: str):
+        if not self.transcript_accumulator.strip():
+            return
+        self._last_activity_ts = time.monotonic()
+        final_text = self.transcript_accumulator.strip()
+        if self._last_audio_sent_ts:
+            logger.info(
+                "STT time (last audio to %s): %.3fs",
+                source, time.monotonic() - self._last_audio_sent_ts
+            )
+        self._speech_final_ts = time.monotonic()
+        logger.info("User: %s", final_text)
+        await self._send_client({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
+        self.transcript_accumulator = ""
+        turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
+        self._current_turn_span = self.tracer.start_span(
+            "voice_turn",
+            attributes={
+                "turn.user_text": final_text,
+                "turn.id": self.turn_counter + 1,
+                "session.id": self.session_id,
+                "openinference.span.kind": "CHAIN",
+                "input.value": final_text,
+                **self.eval_attributes,
+            },
+        ) if self.tracer else None
+
+        with self._in_turn():
+            self._record_span("stt_finalize", turn_start_ns, {
+                "openinference.span.kind": "CHAIN",
+                "output.value": final_text,
+                "stt.source": source,
+            })
+
+        result = await check_input(final_text)
+        if self._current_turn_span:
+            self._current_turn_span.set_attribute("guardrail.input_allowed", result.allowed)
+        if not result.allowed:
+            self._end_turn_span({"guardrail.input_reason": result.reason or ""})
+            await self._speak_guardrail_block()
+            return
+
+        await self.llm_prompt_queue.put(final_text)
+
+    def _strip_dispatched(self, text: str) -> str:
+        """Drop the part of `text` that was already sent via the stable interim path."""
+        if not self._stable_words or time.monotonic() - self._stable_dispatch_ts > STABLE_DISPATCH_DEDUP_SECS:
+            return text
+        n = len(self._stable_words)
+        if _words(text)[:n] == self._stable_words:
+            return " ".join(text.split()[n:])
+        return text    
+
+    async def _stt_handle_responses(self, dg_ws):
+        while True:
+            try:
+                msg = await dg_ws.recv()
+                data = json.loads(msg)
+            except json.JSONDecodeError:
+                logger.warning("Non-JSON message from Deepgram, skipping.")
+                continue
+
+            msg_type = data.get("type")
+            if msg_type == "UtteranceEnd":
+                await self._handle_utterance_end()
+            elif msg_type == "Results":
+                await self._handle_stt_result(data)
+
+    async def _handle_utterance_end(self):
+        logger.info("UtteranceEnd received.")
+        if self._interim_text and time.monotonic() - self._interim_since_ts < self.stable_interim_secs_no_punct:
+            # Deepgram still has an unfinalized interim; wait for its final
+            return
+        await self._dispatch_final_transcript("UtteranceEnd")
+        self._stable_words = []
+        self._interim_text = ""
+
+    async def _handle_stt_result(self, data: dict):
+        alt = data.get("channel", {}).get("alternatives", [{}])[0]
+        transcript = alt.get("transcript", "")
+
+        if transcript:
+            await self._send_client({
+                "transcript_chunk": {
+                    "role": "user",
+                    "turn_id": self.turn_counter + 1,
+                    "text": f"{self.transcript_accumulator} {self._interim_text}".strip(),
+                    "replace": True,
+                }
+            })
+            self._last_activity_ts = time.monotonic()
+            tail = self._strip_dispatched(transcript)
+            new_words = [w for w in _words(tail) if w not in FILLERS]
+
+            logger.info("Interim transcript fragment: %r (is_final=%s) (speech_final=%s)", transcript, data.get("is_final"), data.get("speech_final"))
+
+            if self.is_ai_speaking and not self.interruption_event.is_set() and not self._closing and not self.is_welcome_message_running and new_words:
+                logger.info("Barge-in detected via transcript: %r", transcript)
+                if self._current_turn_span:
+                    self._current_turn_span.set_attribute("turn.interrupted_by_barge_in", True)
+                self.interruption_event.set()
+                self.transcript_accumulator = ""
+                await self._purge_pipeline()
+
+            if data.get("is_final"):
+                if tail.strip():
+                    self.transcript_accumulator += f" {tail}"
+                self._interim_text = ""
+            elif tail.strip() and tail != self._interim_text:
+                self._interim_text = tail
+                self._interim_since_ts = time.monotonic()
+
+        if data.get("speech_final"):
+            await self._dispatch_final_transcript("speech_final")
 
     async def llm_loop(self):
         """Task 3: streams prompts to the LLM via LiteLLM, splits the response into
@@ -496,7 +467,7 @@ class CustomVoiceAgent:
     
             if self._speech_final_ts:
                 logger.info("Time from speech end to LLM dispatch: %.3fs", time.monotonic() - self._speech_final_ts)
-            self._gemini_request_ts = time.monotonic()
+            self._llm_request_ts = time.monotonic()
             self._tts_first_send_ts = None
             logger.info("Sending prompt to LLM: %r", prompt)
             self.sentence_buffer = ""
@@ -507,41 +478,22 @@ class CustomVoiceAgent:
                 {"role": "user", "content": prompt}
             )
     
-            messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+            messages = self._build_messages()
     
-            full_reply = ""
-
-            with (trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext()):
-                if self.tracing and self.tracer:
-                    with self.tracer.start_as_current_span(
-                        "llm_stream",
-                        attributes={
-                            "llm.model": self.model,
-                            "llm.model_name": self.model,
-                            "openinference.span.kind": "LLM",
-                            "input.value": prompt,
-                        },
-                    ) as llm_span:
-                        full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
-                else:
-                    full_reply = await self.llm_call(messages=messages, prompt=prompt)        
+            with self._in_turn(), self._span("llm_stream", {
+                "llm.model": self.model,
+                "llm.model_name": self.model,
+            }) as llm_span:
+                full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
 
             if self._current_turn_span and full_reply.strip():
-                self._current_turn_span.set_attribute("output.value", full_reply[:500])
+                self._current_turn_span.set_attribute("output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
                         
     
           
             if not self._closing:
                 if self.sentence_buffer.strip() and not self.interruption_event.is_set():
-                    final_chunk = strip_markdown_for_speech(self.sentence_buffer)
-                    result = await check_output(final_chunk)
-                    if self._current_turn_span:
-                        self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
-                    if result.allowed:
-                        await self.tts_text_queue.put(final_chunk)
-                        await self._emit_agent_chunk(final_chunk)
-                    else:
-                        logger.info("Output guardrail blocked final chunk: %s", result.reason)
+                    await self._emit_checked_chunk(strip_markdown_for_speech(self.sentence_buffer), flush=False)
 
                 if not self._any_output_sent and not self.interruption_event.is_set():
                     await self._speak_guardrail_block()
@@ -550,27 +502,12 @@ class CustomVoiceAgent:
             self.sentence_buffer = ""
     
             if full_reply.strip() and not self.interruption_event.is_set():
-                spoken = " ".join(self._spoken_text_parts).strip() or full_reply   # add
+                spoken = " ".join(self._spoken_text_parts).strip() or full_reply
                 self.conversation_history.append(
                     {"role": "assistant", "content": full_reply}
                 )
-                try:
-                    await self.client_ws.send_json({"transcript": {"role": "assistant", "text": spoken, "turn_id": self.turn_counter + 1}})
-                except Exception:
-                    pass
-                self.turn_counter += 1
-                try:
-                    await self.client_ws.send_json({
-                        "turn": {
-                            "turn_id": self.turn_counter,
-                            "timestamp": time.time(),
-                            "user": prompt,
-                            "assistant": spoken,
-                            "interrupted": False,
-                        }
-                    })
-                except Exception:
-                    pass
+                await self._send_client({"transcript": {"role": "assistant", "text": spoken, "turn_id": self.turn_counter + 1}})
+                await self._finish_turn(prompt, spoken, interrupted=False)
     
             self.llm_prompt_queue.task_done()
 
@@ -581,41 +518,36 @@ class CustomVoiceAgent:
         for i, ch in enumerate(self.sentence_buffer):
             if ch in SENTENCE_BOUNDARY_CHARS:
                 flush_idx = i
-            elif ch in CLAUSE_BOUNDARY_CHARS and i > 40:
+            elif ch in CLAUSE_BOUNDARY_CHARS and i > MIN_CHARS_BEFORE_CLAUSE_FLUSH:
                 flush_idx = i
     
         if flush_idx != -1:
             text_to_send = strip_markdown_for_speech(self.sentence_buffer[:flush_idx + 1]).strip()
-            remainder = self.sentence_buffer[flush_idx + 1:]
-          
-            if text_to_send:
-                result = await check_output(text_to_send)
-                if self._current_turn_span:
-                    self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
-                if result.allowed:
-                    logger.info("Flushing to tts_text_queue at t=%.3f: %r", time.monotonic(), text_to_send)
-                    await self.tts_text_queue.put(text_to_send)
-                    await self.tts_text_queue.put({"flush": True})
-                    self._any_output_sent = True
-                    await self._emit_agent_chunk(text_to_send)
-                else:
-                    logger.info("Output guardrail blocked chunk: %s", result.reason)
-            self.sentence_buffer = remainder
+            self.sentence_buffer = self.sentence_buffer[flush_idx + 1:]
         elif len(self.sentence_buffer) > MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH:
             text_to_send = strip_markdown_for_speech(self.sentence_buffer).strip()
-         
-            if text_to_send:
-                result = await check_output(text_to_send)
-                if self._current_turn_span:
-                    self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
-                if result.allowed:
-                    await self.tts_text_queue.put(text_to_send)
-                    await self.tts_text_queue.put({"flush": True})
-                    self._any_output_sent = True
-                    await self._emit_agent_chunk(text_to_send)
-                else:
-                    logger.info("Output guardrail blocked chunk: %s", result.reason)
             self.sentence_buffer = ""
+        else:
+            return
+
+        if text_to_send:
+            await self._emit_checked_chunk(text_to_send, flush=True)
+
+    async def _emit_checked_chunk(self, text: str, flush: bool):
+        """Runs the output guardrail on a chunk of the reply and, if allowed,
+        queues it for TTS and shows it in the client transcript."""
+        result = await check_output(text)
+        if self._current_turn_span:
+            self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
+        if not result.allowed:
+            logger.info("Output guardrail blocked chunk: %s", result.reason)
+            return
+        logger.info("Flushing to tts_text_queue at t=%.3f: %r", time.monotonic(), text)
+        await self.tts_text_queue.put(text)
+        if flush:
+            await self.tts_text_queue.put({"flush": True})
+        self._any_output_sent = True
+        await self._emit_agent_chunk(text)
 
 
     async def llm_call(self, messages, prompt, llm_span=None) -> str:
@@ -625,24 +557,13 @@ class CustomVoiceAgent:
             llm_span.set_attribute("input.value", prompt)
         try:
             current_messages = messages
-            hop = 0
-            while hop < MAX_TOOL_HOPS:
+            for _ in range(MAX_TOOL_HOPS):
                 reply_part, tool_calls = await self._stream_completion(current_messages)
                 full_reply += reply_part
 
                 if self.interruption_event.is_set():
                     self.conversation_history.append({"role": "assistant", "content": "No response."})
-                    self.turn_counter += 1
-                    try:
-                        await self.client_ws.send_json({
-                            "turn": {
-                                "turn_id": self.turn_counter, "timestamp": time.time(),
-                                "user": prompt, "assistant": full_reply if full_reply.strip() else None,
-                                "interrupted": True,
-                            }
-                        })
-                    except Exception:
-                        pass
+                    await self._finish_turn(prompt, full_reply if full_reply.strip() else None, interrupted=True)
                     break
 
                 if not tool_calls:
@@ -651,27 +572,22 @@ class CustomVoiceAgent:
                 ok = await self._execute_tool_hop(tool_calls)
                 if not ok:
                     break
-                current_messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
-                hop += 1
+                current_messages = self._build_messages()
                 
             if llm_span:
-                llm_span.set_attribute("llm.response_text", full_reply[:500])
-                llm_span.set_attribute("output.value", full_reply[:500])
-            logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._gemini_request_ts or 0))
+                llm_span.set_attribute("llm.response_text", full_reply[:TRACE_TEXT_MAX_CHARS])
+                llm_span.set_attribute("output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
+            logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._llm_request_ts or 0))
 
-        except exceptions.APIError:
+        except Exception as e:
             if llm_span:
-                llm_span.record_exception(traceback_exc := __import__("sys").exc_info()[1])
-            if StatusCode and llm_span:
-                llm_span.set_status(StatusCode.ERROR)
-            logger.exception("LLM request failed.")
-        except Exception:
-            if llm_span:
-                llm_span.record_exception(__import__("sys").exc_info()[1])
-            if StatusCode and llm_span:    
-                llm_span.set_status(StatusCode.ERROR)
-            logger.exception("Unexpected error during LLM streaming.")
-        return full_reply                             
+                llm_span.record_exception(e)
+                mark_span_error(llm_span)
+            if isinstance(e, exceptions.APIError):
+                logger.exception("LLM request failed.")
+            else:
+                logger.exception("Unexpected error during LLM streaming.")
+        return full_reply
        
 
     async def deepgram_tts_loop(self):
@@ -680,68 +596,54 @@ class CustomVoiceAgent:
         self._dg_tts_ws = await _connect_deepgram(DEEPGRAM_TTS_URL.format(tts_model=self.tts_model), self.deepgram_api_key)
         tts_ws = self._dg_tts_ws
 
-        async def feed_text_to_tts():
-            while True:
-                item = await self.tts_text_queue.get()
-                logger.info("feed_text_to_tts dequeued at t=%.3f: %r", time.monotonic(), item)
-                if isinstance(item, dict) and item.get("flush"):
-                    logger.info("Sending Flush to Deepgram TTS.")
-                    await tts_ws.send(json.dumps({"type": "Flush"}))
-                elif not self.interruption_event.is_set():
-                    if self._tts_first_send_ts is None:
-                        self._tts_first_send_ts = time.monotonic()
-                        self._tts_span_start_ns = time.time_ns()
-                    if self._current_turn_span:
-                        with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
-                            if self.tracing and self.tracer:
-                                with self.tracer.start_as_current_span(
-                                    "tts_stream",
-                                    attributes={
-                                        "tts.text_len": len(item),
-                                        "openinference.span.kind": "CHAIN",
-                                        "input.value": item,
-                                    },
-                                ):
-                                    await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
-                            else:
-                                await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
-                    else:
-                        await tts_ws.send(json.dumps({"type": "Speak", "text": item}))    
-                    logger.info("Sending text to Deepgram TTS at t=%.3f: %r", time.monotonic(), item)
-                    # await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
-                self.tts_text_queue.task_done()
-
-        async def harvest_audio_from_tts():
-            while True:
-                msg = await tts_ws.recv()
-                if isinstance(msg, bytes) and not self.interruption_event.is_set():
-                    if self._tts_first_send_ts is not None:
-                        logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
-                        if self._current_turn_span and self._tts_span_start_ns:
-                            with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracing and self.tracer else contextlib.nullcontext():
-                                if self.tracing and self.tracer:
-                                    gen_span = self.tracer.start_span("tts_generation", start_time=self._tts_span_start_ns)
-                                    gen_span.set_attribute("openinference.span.kind", "CHAIN")
-                                    gen_span.end()
-                        self._tts_first_send_ts = None
-                        self._tts_span_start_ns = None
-                    await self.audio_out_queue.put(msg)
-                else:
-                    try:
-                        data = json.loads(msg)
-                        if data.get("type") == "Flushed":
-                            await self.audio_out_queue.put(_AUDIO_UTTERANCE_END)
-                            self._tts_flush_event.set()
-                            if self._current_turn_span:
-                                self._current_turn_span.end()
-                                self._current_turn_span = None
-                    except json.JSONDecodeError:
-                        pass
-
         try:
-            await asyncio.gather(feed_text_to_tts(), harvest_audio_from_tts())
+            await asyncio.gather(self._tts_feed_text(tts_ws), self._tts_harvest_audio(tts_ws))
         except ConnectionClosed:
             logger.warning("Deepgram TTS connection closed.")
+
+    async def _tts_feed_text(self, tts_ws):
+        while True:
+            item = await self.tts_text_queue.get()
+            logger.info("feed_text_to_tts dequeued at t=%.3f: %r", time.monotonic(), item)
+            if isinstance(item, dict) and item.get("flush"):
+                logger.info("Sending Flush to Deepgram TTS.")
+                await tts_ws.send(json.dumps({"type": "Flush"}))
+            elif not self.interruption_event.is_set():
+                if self._tts_first_send_ts is None:
+                    self._tts_first_send_ts = time.monotonic()
+                    self._tts_span_start_ns = time.time_ns()
+                with self._in_turn(), self._span("tts_stream", {
+                    "tts.text_len": len(item),
+                    "openinference.span.kind": "CHAIN",
+                    "input.value": item,
+                }, require_turn=True):
+                    await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
+                logger.info("Sending text to Deepgram TTS at t=%.3f: %r", time.monotonic(), item)
+            self.tts_text_queue.task_done()
+
+    async def _tts_harvest_audio(self, tts_ws):
+        while True:
+            msg = await tts_ws.recv()
+            if isinstance(msg, bytes) and not self.interruption_event.is_set():
+                if self._tts_first_send_ts is not None:
+                    logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
+                    if self._current_turn_span and self._tts_span_start_ns:
+                        with self._in_turn():
+                            self._record_span("tts_generation", self._tts_span_start_ns, {
+                                "openinference.span.kind": "CHAIN",
+                            })
+                    self._tts_first_send_ts = None
+                    self._tts_span_start_ns = None
+                await self.audio_out_queue.put(msg)
+            else:
+                try:
+                    data = json.loads(msg)
+                    if data.get("type") == "Flushed":
+                        await self.audio_out_queue.put(_AUDIO_UTTERANCE_END)
+                        self._tts_flush_event.set()
+                        self._end_turn_span()
+                except json.JSONDecodeError:
+                    pass
 
     async def write_client_speaker_loop(self):
         while True:
@@ -751,7 +653,6 @@ class CustomVoiceAgent:
                     await self.client_ws.send_json({"control": "utterance_end"})
                     continue
 
-                self._last_audio_out_ts = time.monotonic()
                 if not self.interruption_event.is_set():
                     self.is_ai_speaking = True
                     await self.client_ws.send_bytes(audio_payload)
@@ -799,12 +700,11 @@ class CustomVoiceAgent:
         self.is_ai_speaking = True  # Hold this True so the loop knows audio is expected
     
         # 4. Enqueue the final text
-        await self.tts_text_queue.put(strip_markdown_for_speech(text))
-        await self.tts_text_queue.put({"flush": True})
+        await self._speak(text)
         
         # 5. Wait for the audio to generate, land in the queue, and finish playing
         # Wait a brief moment for the generator to catch up before checking if queues are empty
-        await asyncio.sleep(0.3) 
+        await asyncio.sleep(GOODBYE_TTS_GRACE_SECONDS) 
         
         try:
             await asyncio.wait_for(
@@ -840,16 +740,8 @@ class CustomVoiceAgent:
         tells the browser to drop whatever it has already buffered."""
         # Purge AI output only; interrupted user audio (audio_in_queue)
         # must stay alive so the interrupted turn becomes the new prompt.
-        if self._current_turn_span:
-            self._current_turn_span.set_attribute("turn.interrupted", True)
-            self._current_turn_span.end()
-            self._current_turn_span = None
-
-        if self._active_tool_task is not None:
-            for t in self._active_tool_task:
-                if not t.done():
-                    t.cancel()
-            self._active_tool_task = None    
+        self._end_turn_span({"turn.interrupted": True})
+        self._cancel_tool_tasks()
 
         for q in (self.llm_prompt_queue, self.tts_text_queue, self.audio_out_queue):
             while not q.empty():
@@ -861,10 +753,7 @@ class CustomVoiceAgent:
                 
         self.is_ai_speaking = False
         self.interruption_event.clear()
-        try:
-            await self.client_ws.send_json({"control": "clear_speaker_buffer"})
-        except Exception:
-            pass
+        await self._send_client({"control": "clear_speaker_buffer"})
         if self._dg_tts_ws is not None:
             try:
                 await self._dg_tts_ws.send(json.dumps({"type": "Clear"}))
@@ -872,66 +761,111 @@ class CustomVoiceAgent:
                 pass
 
     async def _emit_agent_chunk(self, text: str):
-            self._spoken_text_parts.append(text)
-            try:
-                await self.client_ws.send_json({
-                    "transcript_chunk": {
-                        "role": "assistant",
-                        "turn_id": self.turn_counter + 1,
-                        "text": text,
-                    }
-                })
-            except Exception:
-                pass    
+        self._spoken_text_parts.append(text)
+        await self._send_client({
+            "transcript_chunk": {
+                "role": "assistant",
+                "turn_id": self.turn_counter + 1,
+                "text": text,
+            }
+        })
+
+    async def _send_client(self, payload: dict):
+        """Best-effort JSON message to the browser; a closed socket is ignored."""
+        try:
+            await self.client_ws.send_json(payload)
+        except Exception:
+            pass
+
+    async def _speak(self, text: str):
+        """Queues a complete message for TTS, followed by a flush."""
+        await self.tts_text_queue.put(strip_markdown_for_speech(text))
+        await self.tts_text_queue.put({"flush": True})
+
+    def _cancel_tool_tasks(self):
+        if self._active_tool_tasks is not None:
+            for t in self._active_tool_tasks:
+                if not t.done():
+                    t.cancel()
+            self._active_tool_tasks = None
+
+    def _end_turn_span(self, attributes: dict | None = None):
+        if self._current_turn_span:
+            for key, value in (attributes or {}).items():
+                self._current_turn_span.set_attribute(key, value)
+            self._current_turn_span.end()
+            self._current_turn_span = None
+
+    def _build_messages(self) -> list[dict]:
+        return [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+
+    async def _finish_turn(self, user: str, assistant: str | None, interrupted: bool):
+        """Advances the turn counter and sends the turn record to the client."""
+        self.turn_counter += 1
+        await self._send_client({
+            "turn": {
+                "turn_id": self.turn_counter,
+                "timestamp": time.time(),
+                "user": user,
+                "assistant": assistant,
+                "interrupted": interrupted,
+            }
+        })
+
+    def _in_turn(self):
+        """Makes the current turn span the parent of spans started inside it."""
+        if self._current_turn_span is None or trace is None:
+            return contextlib.nullcontext()
+        return trace.use_span(self._current_turn_span, end_on_exit=False)
+
+    def _span(self, name: str, attributes: dict, require_turn: bool = False):
+        """Starts a span as the current span; yields None when tracing is off
+        (or, with require_turn, when no turn span is open)."""
+        if self.tracer is None or (require_turn and self._current_turn_span is None):
+            return contextlib.nullcontext()
+        return self.tracer.start_as_current_span(name, attributes=attributes)
+
+    def _record_span(self, name: str, start_time: int, attributes: dict):
+        """Records a span that started at start_time and ends now."""
+        if self.tracer:
+            self.tracer.start_span(name, start_time=start_time, attributes=attributes).end()
 
     async def _speak_guardrail_block(self):
         self.is_ai_speaking = True
-        await self.tts_text_queue.put(strip_markdown_for_speech(GUARDRAIL_BLOCK_MESSAGE))
-        await self.tts_text_queue.put({"flush": True})     
+        await self._speak(GUARDRAIL_BLOCK_MESSAGE)
 
     async def _send_greeting(self):
         self.is_welcome_message_running = True
         self.is_ai_speaking = True
-        await self.tts_text_queue.put(strip_markdown_for_speech(self.greeting_message))
-        await self.tts_text_queue.put({"flush": True})      
+        await self._speak(self.greeting_message)
 
     async def _run_tool_call(self, name: str, args: dict) -> dict:
         impl = self.tool_registry.lookup(name)
         if impl is None:
             return {"error": f"unknown tool: {name}"}
-        if self.tracing and self.tracer:
-            serialized_args = json.dumps(args, default=str)
-            with self.tracer.start_as_current_span(
-                "tool_call",
-                attributes={
-                    "tool.name": name,
-                    "tool.args": serialized_args,
-                    "openinference.span.kind": "TOOL",
-                    "input.value": serialized_args,
-                },
-            ) as span:
-                try:
-                    result = await impl(**args)
-                    serialized_result = json.dumps(result, default=str)[:500]
-                    span.set_attribute("tool.result", serialized_result)
-                    span.set_attribute("output.value", serialized_result)
-                    return result
-                except asyncio.CancelledError:
-                    span.set_attribute("tool.cancelled", True)
-                    raise
-                except Exception as e:
-                    span.record_exception(e)
-                    if StatusCode:
-                        span.set_status(StatusCode.ERROR)
-                    return {"error": str(e)}
-        else:
+        serialized_args = json.dumps(args, default=str) if self.tracer else ""
+        with self._span("tool_call", {
+            "tool.name": name,
+            "tool.args": serialized_args,
+            "openinference.span.kind": "TOOL",
+            "input.value": serialized_args,
+        }) as span:
             try:
                 result = await impl(**args)
+                if span:
+                    serialized_result = json.dumps(result, default=str)[:TRACE_TEXT_MAX_CHARS]
+                    span.set_attribute("tool.result", serialized_result)
+                    span.set_attribute("output.value", serialized_result)
                 return result
             except asyncio.CancelledError:
+                if span:
+                    span.set_attribute("tool.cancelled", True)
                 raise
             except Exception as e:
-                return {"error": str(e)}   
+                if span:
+                    span.record_exception(e)
+                    mark_span_error(span)
+                return {"error": str(e)}
 
 
     async def _stream_completion(self, messages: list) -> tuple[str, dict[int, dict]]:
@@ -944,10 +878,9 @@ class CustomVoiceAgent:
             model=self.model,
             messages=messages,
             stream=True,
-            timeout=30.0,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
             api_key=self.llm_provider_api_key,
             tools=self.tool_registry.schemas() or None,
-            # tool_choice="auto",
         ))
 
         async for chunk in response:
@@ -962,7 +895,7 @@ class CustomVoiceAgent:
             if text_token:
                 reply += text_token
                 if not first_token_logged:
-                    logger.info("LLM time to first token: %.3fs", time.monotonic() - (self._gemini_request_ts or 0.0))
+                    logger.info("LLM time to first token: %.3fs", time.monotonic() - (self._llm_request_ts or 0.0))
                     first_token_logged = True
                 await self._buffer_and_dispatch(text_token)
 
@@ -990,10 +923,8 @@ class CustomVoiceAgent:
 
 
     async def _execute_tool_hop(self, tool_call_accumulator: dict[int, dict]) -> bool:
-        filler = random.choice(TOOL_FILLER_PHRASES)
         self.is_ai_speaking = True
-        await self.tts_text_queue.put(strip_markdown_for_speech(filler))
-        await self.tts_text_queue.put({"flush": True})
+        await self._speak(random.choice(TOOL_FILLER_PHRASES))
 
         entries = list(tool_call_accumulator.values())
 
@@ -1017,12 +948,12 @@ class CustomVoiceAgent:
             asyncio.create_task(self._run_tool_call(entry["name"], args))
             for entry, args in zip(entries, parsed_args)
         ]
-        self._active_tool_task = tool_tasks  # now a list, shared cancellation handle
+        self._active_tool_tasks = tool_tasks
 
         tools_group = asyncio.gather(*tool_tasks, return_exceptions=True)
         interrupt_wait_task = asyncio.create_task(self.interruption_event.wait())
 
-        done, pending = await asyncio.wait(
+        done, _ = await asyncio.wait(
             [tools_group, interrupt_wait_task],
             timeout=TOOL_CALL_TIMEOUT_SECONDS,
             return_when=asyncio.FIRST_COMPLETED,
@@ -1032,18 +963,12 @@ class CustomVoiceAgent:
 
         if interrupt_wait_task in done or tools_group not in done:
             # interrupted, or timed out
-            for t in tool_tasks:
-                if not t.done():
-                    t.cancel()
-            self._active_tool_task = None
+            self._cancel_tool_tasks()
             if interrupt_wait_task not in done:
-                await self.tts_text_queue.put(
-                    strip_markdown_for_speech("That's taking longer than expected, let me get back to you.")
-                )
-                await self.tts_text_queue.put({"flush": True})
+                await self._speak("That's taking longer than expected, let me get back to you.")
             return False
 
-        self._active_tool_task = None
+        self._active_tool_tasks = None
 
         if self.interruption_event.is_set():
             return False
@@ -1123,7 +1048,6 @@ async def run_voice_session(
             eval_run_id=eval_run_id,
             eval_case_id=eval_case_id,
             eval_variant=eval_variant,
-            **kwargs,
         )
         await agent.run()
     except asyncio.CancelledError:
