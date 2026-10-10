@@ -53,12 +53,9 @@ try:
     from opentelemetry import trace
     from opentelemetry.trace import StatusCode
 except Exception:
+    # Tracing extra not installed: self.tracer stays None, so no span is ever created.
+    trace = None
     StatusCode = None
-    # Dummy trace module so trace.use_span() works when OTEL is absent
-    class DummyTrace:
-        def use_span(self, span, end_on_exit=False):
-            return contextlib.nullcontext()
-    trace = DummyTrace()
 
 logger = logging.getLogger("voice_agent")
 _AUDIO_UTTERANCE_END = object()
@@ -377,33 +374,24 @@ class CustomVoiceAgent:
             await self._send_client({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
             self.transcript_accumulator = ""
             turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
-            if self.tracer:
-                self._current_turn_span = self.tracer.start_span(
-                    "voice_turn",
-                    attributes={
-                        "turn.user_text": final_text,
-                        "turn.id": self.turn_counter + 1,
-                        "session.id": self.session_id,
-                        "openinference.span.kind": "CHAIN",
-                        "input.value": final_text,
-                        **self.eval_attributes,
-                    },
-                )
-            else:
-                self._current_turn_span = None
-            
-            with trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext():
-                if self.tracer:
-                    stt_span = self.tracer.start_span(
-                        "stt_finalize",
-                        start_time=turn_start_ns,
-                        attributes={
-                            "openinference.span.kind": "CHAIN",
-                            "output.value": final_text,
-                        },
-                    )
-                    stt_span.set_attribute("stt.source", source)
-                    stt_span.end()
+            self._current_turn_span = self.tracer.start_span(
+                "voice_turn",
+                attributes={
+                    "turn.user_text": final_text,
+                    "turn.id": self.turn_counter + 1,
+                    "session.id": self.session_id,
+                    "openinference.span.kind": "CHAIN",
+                    "input.value": final_text,
+                    **self.eval_attributes,
+                },
+            ) if self.tracer else None
+
+            with self._in_turn():
+                self._record_span("stt_finalize", turn_start_ns, {
+                    "openinference.span.kind": "CHAIN",
+                    "output.value": final_text,
+                    "stt.source": source,
+                })
 
             result = await check_input(final_text)
             if self._current_turn_span:
@@ -486,7 +474,7 @@ class CustomVoiceAgent:
         try:
             await asyncio.gather(forward_audio_to_dg(), handle_dg_responses(), stable_interim_watcher())
         except ConnectionClosed:
-            if self._current_turn_span and StatusCode:
+            if self._current_turn_span:
                 self._current_turn_span.set_status(StatusCode.ERROR)
                 self._current_turn_span.set_attribute("error.source", "deepgram_stt")
             logger.warning("Deepgram STT connection closed.")
@@ -520,20 +508,13 @@ class CustomVoiceAgent:
     
             full_reply = ""
 
-            with (trace.use_span(self._current_turn_span, end_on_exit=False) if self._current_turn_span else contextlib.nullcontext()):
-                if self.tracer:
-                    with self.tracer.start_as_current_span(
-                        "llm_stream",
-                        attributes={
-                            "llm.model": self.model,
-                            "llm.model_name": self.model,
-                            "openinference.span.kind": "LLM",
-                            "input.value": prompt,
-                        },
-                    ) as llm_span:
-                        full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
-                else:
-                    full_reply = await self.llm_call(messages=messages, prompt=prompt)        
+            with self._in_turn(), self._span("llm_stream", {
+                "llm.model": self.model,
+                "llm.model_name": self.model,
+                "openinference.span.kind": "LLM",
+                "input.value": prompt,
+            }) as llm_span:
+                full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
 
             if self._current_turn_span and full_reply.strip():
                 self._current_turn_span.set_attribute("output.value", full_reply[:500])
@@ -678,22 +659,12 @@ class CustomVoiceAgent:
                     if self._tts_first_send_ts is None:
                         self._tts_first_send_ts = time.monotonic()
                         self._tts_span_start_ns = time.time_ns()
-                    if self._current_turn_span:
-                        with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracer else contextlib.nullcontext():
-                            if self.tracer:
-                                with self.tracer.start_as_current_span(
-                                    "tts_stream",
-                                    attributes={
-                                        "tts.text_len": len(item),
-                                        "openinference.span.kind": "CHAIN",
-                                        "input.value": item,
-                                    },
-                                ):
-                                    await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
-                            else:
-                                await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
-                    else:
-                        await tts_ws.send(json.dumps({"type": "Speak", "text": item}))    
+                    with self._in_turn(), self._span("tts_stream", {
+                        "tts.text_len": len(item),
+                        "openinference.span.kind": "CHAIN",
+                        "input.value": item,
+                    }, require_turn=True):
+                        await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
                     logger.info("Sending text to Deepgram TTS at t=%.3f: %r", time.monotonic(), item)
                 self.tts_text_queue.task_done()
 
@@ -704,11 +675,10 @@ class CustomVoiceAgent:
                     if self._tts_first_send_ts is not None:
                         logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
                         if self._current_turn_span and self._tts_span_start_ns:
-                            with trace.use_span(self._current_turn_span, end_on_exit=False) if self.tracer else contextlib.nullcontext():
-                                if self.tracer:
-                                    gen_span = self.tracer.start_span("tts_generation", start_time=self._tts_span_start_ns)
-                                    gen_span.set_attribute("openinference.span.kind", "CHAIN")
-                                    gen_span.end()
+                            with self._in_turn():
+                                self._record_span("tts_generation", self._tts_span_start_ns, {
+                                    "openinference.span.kind": "CHAIN",
+                                })
                         self._tts_first_send_ts = None
                         self._tts_span_start_ns = None
                     await self.audio_out_queue.put(msg)
@@ -881,6 +851,24 @@ class CustomVoiceAgent:
     def _build_messages(self) -> list[dict]:
         return [{"role": "system", "content": self.system_prompt}] + self.conversation_history
 
+    def _in_turn(self):
+        """Makes the current turn span the parent of spans started inside it."""
+        if self._current_turn_span is None:
+            return contextlib.nullcontext()
+        return trace.use_span(self._current_turn_span, end_on_exit=False)
+
+    def _span(self, name: str, attributes: dict, require_turn: bool = False):
+        """Starts a span as the current span; yields None when tracing is off
+        (or, with require_turn, when no turn span is open)."""
+        if self.tracer is None or (require_turn and self._current_turn_span is None):
+            return contextlib.nullcontext()
+        return self.tracer.start_as_current_span(name, attributes=attributes)
+
+    def _record_span(self, name: str, start_time: int, attributes: dict):
+        """Records a span that started at start_time and ends now."""
+        if self.tracer:
+            self.tracer.start_span(name, start_time=start_time, attributes=attributes).end()
+
     async def _speak_guardrail_block(self):
         self.is_ai_speaking = True
         await self._speak(GUARDRAIL_BLOCK_MESSAGE)
@@ -894,39 +882,29 @@ class CustomVoiceAgent:
         impl = self.tool_registry.lookup(name)
         if impl is None:
             return {"error": f"unknown tool: {name}"}
-        if self.tracer:
-            serialized_args = json.dumps(args, default=str)
-            with self.tracer.start_as_current_span(
-                "tool_call",
-                attributes={
-                    "tool.name": name,
-                    "tool.args": serialized_args,
-                    "openinference.span.kind": "TOOL",
-                    "input.value": serialized_args,
-                },
-            ) as span:
-                try:
-                    result = await impl(**args)
+        serialized_args = json.dumps(args, default=str) if self.tracer else ""
+        with self._span("tool_call", {
+            "tool.name": name,
+            "tool.args": serialized_args,
+            "openinference.span.kind": "TOOL",
+            "input.value": serialized_args,
+        }) as span:
+            try:
+                result = await impl(**args)
+                if span:
                     serialized_result = json.dumps(result, default=str)[:500]
                     span.set_attribute("tool.result", serialized_result)
                     span.set_attribute("output.value", serialized_result)
-                    return result
-                except asyncio.CancelledError:
-                    span.set_attribute("tool.cancelled", True)
-                    raise
-                except Exception as e:
-                    span.record_exception(e)
-                    if StatusCode:
-                        span.set_status(StatusCode.ERROR)
-                    return {"error": str(e)}
-        else:
-            try:
-                result = await impl(**args)
                 return result
             except asyncio.CancelledError:
+                if span:
+                    span.set_attribute("tool.cancelled", True)
                 raise
             except Exception as e:
-                return {"error": str(e)}   
+                if span:
+                    span.record_exception(e)
+                    span.set_status(StatusCode.ERROR)
+                return {"error": str(e)}
 
 
     async def _stream_completion(self, messages: list) -> tuple[str, dict[int, dict]]:
