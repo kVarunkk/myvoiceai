@@ -278,12 +278,7 @@ class CustomVoiceAgent:
             await self._shutdown()
 
     async def _shutdown(self):
-        if self._active_tool_tasks is not None:
-            for t in self._active_tool_tasks:
-                if not t.done():
-                    t.cancel()
-            self._active_tool_tasks = None
-
+        self._cancel_tool_tasks()
 
         for task in self._tasks:
             if not task.done():
@@ -379,10 +374,7 @@ class CustomVoiceAgent:
                 )
             self._speech_final_ts = time.monotonic()
             logger.info("User: %s", final_text)
-            try:
-                await self.client_ws.send_json({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
-            except Exception:
-                pass
+            await self._send_client({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
             self.transcript_accumulator = ""
             turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
             if self.tracer:
@@ -417,10 +409,7 @@ class CustomVoiceAgent:
             if self._current_turn_span:
                 self._current_turn_span.set_attribute("guardrail.input_allowed", result.allowed)
             if not result.allowed:
-                if self._current_turn_span:
-                    self._current_turn_span.set_attribute("guardrail.input_reason", result.reason or "")
-                    self._current_turn_span.end()
-                    self._current_turn_span = None
+                self._end_turn_span({"guardrail.input_reason": result.reason or ""})
                 await self._speak_guardrail_block()
                 return
             
@@ -461,17 +450,14 @@ class CustomVoiceAgent:
                     transcript = alt.get("transcript", "")
     
                     if transcript:
-                        try:
-                            await self.client_ws.send_json({
-                                "transcript_chunk": {
-                                    "role": "user",
-                                    "turn_id": self.turn_counter + 1,
-                                    "text": f"{self.transcript_accumulator} {self._interim_text}".strip(),
-                                    "replace": True,
-                                }
-                            })
-                        except Exception:
-                            pass
+                        await self._send_client({
+                            "transcript_chunk": {
+                                "role": "user",
+                                "turn_id": self.turn_counter + 1,
+                                "text": f"{self.transcript_accumulator} {self._interim_text}".strip(),
+                                "replace": True,
+                            }
+                        })
                         self._last_activity_ts = time.monotonic()
                         tail = strip_dispatched(transcript)
                         new_words = [w for w in _words(tail) if w not in FILLERS]
@@ -530,7 +516,7 @@ class CustomVoiceAgent:
                 {"role": "user", "content": prompt}
             )
     
-            messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+            messages = self._build_messages()
     
             full_reply = ""
 
@@ -556,16 +542,7 @@ class CustomVoiceAgent:
           
             if not self._closing:
                 if self.sentence_buffer.strip() and not self.interruption_event.is_set():
-                    final_chunk = strip_markdown_for_speech(self.sentence_buffer)
-                    result = await check_output(final_chunk)
-                    if self._current_turn_span:
-                        self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
-                    if result.allowed:
-                        await self.tts_text_queue.put(final_chunk)
-                        self._any_output_sent = True
-                        await self._emit_agent_chunk(final_chunk)
-                    else:
-                        logger.info("Output guardrail blocked final chunk: %s", result.reason)
+                    await self._emit_checked_chunk(strip_markdown_for_speech(self.sentence_buffer), flush=False)
 
                 if not self._any_output_sent and not self.interruption_event.is_set():
                     await self._speak_guardrail_block()
@@ -578,23 +555,17 @@ class CustomVoiceAgent:
                 self.conversation_history.append(
                     {"role": "assistant", "content": full_reply}
                 )
-                try:
-                    await self.client_ws.send_json({"transcript": {"role": "assistant", "text": spoken, "turn_id": self.turn_counter + 1}})
-                except Exception:
-                    pass
+                await self._send_client({"transcript": {"role": "assistant", "text": spoken, "turn_id": self.turn_counter + 1}})
                 self.turn_counter += 1
-                try:
-                    await self.client_ws.send_json({
-                        "turn": {
-                            "turn_id": self.turn_counter,
-                            "timestamp": time.time(),
-                            "user": prompt,
-                            "assistant": spoken,
-                            "interrupted": False,
-                        }
-                    })
-                except Exception:
-                    pass
+                await self._send_client({
+                    "turn": {
+                        "turn_id": self.turn_counter,
+                        "timestamp": time.time(),
+                        "user": prompt,
+                        "assistant": spoken,
+                        "interrupted": False,
+                    }
+                })
     
             self.llm_prompt_queue.task_done()
 
@@ -610,36 +581,31 @@ class CustomVoiceAgent:
     
         if flush_idx != -1:
             text_to_send = strip_markdown_for_speech(self.sentence_buffer[:flush_idx + 1]).strip()
-            remainder = self.sentence_buffer[flush_idx + 1:]
-          
-            if text_to_send:
-                result = await check_output(text_to_send)
-                if self._current_turn_span:
-                    self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
-                if result.allowed:
-                    logger.info("Flushing to tts_text_queue at t=%.3f: %r", time.monotonic(), text_to_send)
-                    await self.tts_text_queue.put(text_to_send)
-                    await self.tts_text_queue.put({"flush": True})
-                    self._any_output_sent = True
-                    await self._emit_agent_chunk(text_to_send)
-                else:
-                    logger.info("Output guardrail blocked chunk: %s", result.reason)
-            self.sentence_buffer = remainder
+            self.sentence_buffer = self.sentence_buffer[flush_idx + 1:]
         elif len(self.sentence_buffer) > MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH:
             text_to_send = strip_markdown_for_speech(self.sentence_buffer).strip()
-         
-            if text_to_send:
-                result = await check_output(text_to_send)
-                if self._current_turn_span:
-                    self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
-                if result.allowed:
-                    await self.tts_text_queue.put(text_to_send)
-                    await self.tts_text_queue.put({"flush": True})
-                    self._any_output_sent = True
-                    await self._emit_agent_chunk(text_to_send)
-                else:
-                    logger.info("Output guardrail blocked chunk: %s", result.reason)
             self.sentence_buffer = ""
+        else:
+            return
+
+        if text_to_send:
+            await self._emit_checked_chunk(text_to_send, flush=True)
+
+    async def _emit_checked_chunk(self, text: str, flush: bool):
+        """Runs the output guardrail on a chunk of the reply and, if allowed,
+        queues it for TTS and shows it in the client transcript."""
+        result = await check_output(text)
+        if self._current_turn_span:
+            self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
+        if not result.allowed:
+            logger.info("Output guardrail blocked chunk: %s", result.reason)
+            return
+        logger.info("Flushing to tts_text_queue at t=%.3f: %r", time.monotonic(), text)
+        await self.tts_text_queue.put(text)
+        if flush:
+            await self.tts_text_queue.put({"flush": True})
+        self._any_output_sent = True
+        await self._emit_agent_chunk(text)
 
 
     async def llm_call(self, messages, prompt, llm_span=None) -> str:
@@ -657,16 +623,13 @@ class CustomVoiceAgent:
                 if self.interruption_event.is_set():
                     self.conversation_history.append({"role": "assistant", "content": "No response."})
                     self.turn_counter += 1
-                    try:
-                        await self.client_ws.send_json({
-                            "turn": {
-                                "turn_id": self.turn_counter, "timestamp": time.time(),
-                                "user": prompt, "assistant": full_reply if full_reply.strip() else None,
-                                "interrupted": True,
-                            }
-                        })
-                    except Exception:
-                        pass
+                    await self._send_client({
+                        "turn": {
+                            "turn_id": self.turn_counter, "timestamp": time.time(),
+                            "user": prompt, "assistant": full_reply if full_reply.strip() else None,
+                            "interrupted": True,
+                        }
+                    })
                     break
 
                 if not tool_calls:
@@ -675,7 +638,7 @@ class CustomVoiceAgent:
                 ok = await self._execute_tool_hop(tool_calls)
                 if not ok:
                     break
-                current_messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+                current_messages = self._build_messages()
                 hop += 1
                 
             if llm_span:
@@ -755,9 +718,7 @@ class CustomVoiceAgent:
                         if data.get("type") == "Flushed":
                             await self.audio_out_queue.put(_AUDIO_UTTERANCE_END)
                             self._tts_flush_event.set()
-                            if self._current_turn_span:
-                                self._current_turn_span.end()
-                                self._current_turn_span = None
+                            self._end_turn_span()
                     except json.JSONDecodeError:
                         pass
 
@@ -821,8 +782,7 @@ class CustomVoiceAgent:
         self.is_ai_speaking = True  # Hold this True so the loop knows audio is expected
     
         # 4. Enqueue the final text
-        await self.tts_text_queue.put(strip_markdown_for_speech(text))
-        await self.tts_text_queue.put({"flush": True})
+        await self._speak(text)
         
         # 5. Wait for the audio to generate, land in the queue, and finish playing
         # Wait a brief moment for the generator to catch up before checking if queues are empty
@@ -862,16 +822,8 @@ class CustomVoiceAgent:
         tells the browser to drop whatever it has already buffered."""
         # Purge AI output only; interrupted user audio (audio_in_queue)
         # must stay alive so the interrupted turn becomes the new prompt.
-        if self._current_turn_span:
-            self._current_turn_span.set_attribute("turn.interrupted", True)
-            self._current_turn_span.end()
-            self._current_turn_span = None
-
-        if self._active_tool_tasks is not None:
-            for t in self._active_tool_tasks:
-                if not t.done():
-                    t.cancel()
-            self._active_tool_tasks = None    
+        self._end_turn_span({"turn.interrupted": True})
+        self._cancel_tool_tasks()
 
         for q in (self.llm_prompt_queue, self.tts_text_queue, self.audio_out_queue):
             while not q.empty():
@@ -883,10 +835,7 @@ class CustomVoiceAgent:
                 
         self.is_ai_speaking = False
         self.interruption_event.clear()
-        try:
-            await self.client_ws.send_json({"control": "clear_speaker_buffer"})
-        except Exception:
-            pass
+        await self._send_client({"control": "clear_speaker_buffer"})
         if self._dg_tts_ws is not None:
             try:
                 await self._dg_tts_ws.send(json.dumps({"type": "Clear"}))
@@ -894,28 +843,52 @@ class CustomVoiceAgent:
                 pass
 
     async def _emit_agent_chunk(self, text: str):
-            self._spoken_text_parts.append(text)
-            try:
-                await self.client_ws.send_json({
-                    "transcript_chunk": {
-                        "role": "assistant",
-                        "turn_id": self.turn_counter + 1,
-                        "text": text,
-                    }
-                })
-            except Exception:
-                pass    
+        self._spoken_text_parts.append(text)
+        await self._send_client({
+            "transcript_chunk": {
+                "role": "assistant",
+                "turn_id": self.turn_counter + 1,
+                "text": text,
+            }
+        })
+
+    async def _send_client(self, payload: dict):
+        """Best-effort JSON message to the browser; a closed socket is ignored."""
+        try:
+            await self.client_ws.send_json(payload)
+        except Exception:
+            pass
+
+    async def _speak(self, text: str):
+        """Queues a complete message for TTS, followed by a flush."""
+        await self.tts_text_queue.put(strip_markdown_for_speech(text))
+        await self.tts_text_queue.put({"flush": True})
+
+    def _cancel_tool_tasks(self):
+        if self._active_tool_tasks is not None:
+            for t in self._active_tool_tasks:
+                if not t.done():
+                    t.cancel()
+            self._active_tool_tasks = None
+
+    def _end_turn_span(self, attributes: dict | None = None):
+        if self._current_turn_span:
+            for key, value in (attributes or {}).items():
+                self._current_turn_span.set_attribute(key, value)
+            self._current_turn_span.end()
+            self._current_turn_span = None
+
+    def _build_messages(self) -> list[dict]:
+        return [{"role": "system", "content": self.system_prompt}] + self.conversation_history
 
     async def _speak_guardrail_block(self):
         self.is_ai_speaking = True
-        await self.tts_text_queue.put(strip_markdown_for_speech(GUARDRAIL_BLOCK_MESSAGE))
-        await self.tts_text_queue.put({"flush": True})     
+        await self._speak(GUARDRAIL_BLOCK_MESSAGE)
 
     async def _send_greeting(self):
         self.is_welcome_message_running = True
         self.is_ai_speaking = True
-        await self.tts_text_queue.put(strip_markdown_for_speech(self.greeting_message))
-        await self.tts_text_queue.put({"flush": True})      
+        await self._speak(self.greeting_message)
 
     async def _run_tool_call(self, name: str, args: dict) -> dict:
         impl = self.tool_registry.lookup(name)
@@ -1011,10 +984,8 @@ class CustomVoiceAgent:
 
 
     async def _execute_tool_hop(self, tool_call_accumulator: dict[int, dict]) -> bool:
-        filler = random.choice(TOOL_FILLER_PHRASES)
         self.is_ai_speaking = True
-        await self.tts_text_queue.put(strip_markdown_for_speech(filler))
-        await self.tts_text_queue.put({"flush": True})
+        await self._speak(random.choice(TOOL_FILLER_PHRASES))
 
         entries = list(tool_call_accumulator.values())
 
@@ -1053,15 +1024,9 @@ class CustomVoiceAgent:
 
         if interrupt_wait_task in done or tools_group not in done:
             # interrupted, or timed out
-            for t in tool_tasks:
-                if not t.done():
-                    t.cancel()
-            self._active_tool_tasks = None
+            self._cancel_tool_tasks()
             if interrupt_wait_task not in done:
-                await self.tts_text_queue.put(
-                    strip_markdown_for_speech("That's taking longer than expected, let me get back to you.")
-                )
-                await self.tts_text_queue.put({"flush": True})
+                await self._speak("That's taking longer than expected, let me get back to you.")
             return False
 
         self._active_tool_tasks = None
