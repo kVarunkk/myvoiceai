@@ -27,18 +27,24 @@ from myvoiceai.lib.constants import (
     DEFAULT_MAX_SESSION_SECONDS,
     DEFAULT_UTTERANCE_END,
     FILLERS,
+    GOODBYE_TTS_GRACE_SECONDS,
     GUARDRAIL_BLOCK_MESSAGE,
     INACTIVITY_MESSAGE,
     LLM_MODEL,
+    LLM_REQUEST_TIMEOUT_SECONDS,
     MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH,
     MAX_DURATION_MESSAGE,
     MAX_TOOL_HOPS,
+    MIN_CHARS_BEFORE_CLAUSE_FLUSH,
     SENTENCE_BOUNDARY_CHARS,
+    STABLE_DISPATCH_DEDUP_SECS,
     STABLE_INTERIM_NO_PUNCT_SECS,
+    STABLE_INTERIM_POLL_SECS,
     STABLE_INTERIM_SECS,
     SYSTEM_PROMPT,
     TOOL_CALL_TIMEOUT_SECONDS,
     TOOL_FILLER_PHRASES,
+    TRACE_TEXT_MAX_CHARS,
 )
 from myvoiceai.tools import ToolRegistry, get_default_registry
 from myvoiceai.tracing import OTLPExporterConfig, create_tracer_provider, mark_span_error, trace
@@ -308,7 +314,7 @@ class CustomVoiceAgent:
 
     async def _stt_stable_interim_watcher(self):
         while True:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(STABLE_INTERIM_POLL_SECS)
             t = self._interim_text
             if not t:
                 continue
@@ -378,7 +384,7 @@ class CustomVoiceAgent:
 
     def _strip_dispatched(self, text: str) -> str:
         """Drop the part of `text` that was already sent via the stable interim path."""
-        if not self._stable_words or time.monotonic() - self._stable_dispatch_ts > 5:
+        if not self._stable_words or time.monotonic() - self._stable_dispatch_ts > STABLE_DISPATCH_DEDUP_SECS:
             return text
         n = len(self._stable_words)
         if _words(text)[:n] == self._stable_words:
@@ -481,7 +487,7 @@ class CustomVoiceAgent:
                 full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
 
             if self._current_turn_span and full_reply.strip():
-                self._current_turn_span.set_attribute("output.value", full_reply[:500])
+                self._current_turn_span.set_attribute("output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
                         
     
           
@@ -512,7 +518,7 @@ class CustomVoiceAgent:
         for i, ch in enumerate(self.sentence_buffer):
             if ch in SENTENCE_BOUNDARY_CHARS:
                 flush_idx = i
-            elif ch in CLAUSE_BOUNDARY_CHARS and i > 40:
+            elif ch in CLAUSE_BOUNDARY_CHARS and i > MIN_CHARS_BEFORE_CLAUSE_FLUSH:
                 flush_idx = i
     
         if flush_idx != -1:
@@ -569,8 +575,8 @@ class CustomVoiceAgent:
                 current_messages = self._build_messages()
                 
             if llm_span:
-                llm_span.set_attribute("llm.response_text", full_reply[:500])
-                llm_span.set_attribute("output.value", full_reply[:500])
+                llm_span.set_attribute("llm.response_text", full_reply[:TRACE_TEXT_MAX_CHARS])
+                llm_span.set_attribute("output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
             logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._llm_request_ts or 0))
 
         except Exception as e:
@@ -698,7 +704,7 @@ class CustomVoiceAgent:
         
         # 5. Wait for the audio to generate, land in the queue, and finish playing
         # Wait a brief moment for the generator to catch up before checking if queues are empty
-        await asyncio.sleep(0.3) 
+        await asyncio.sleep(GOODBYE_TTS_GRACE_SECONDS) 
         
         try:
             await asyncio.wait_for(
@@ -847,7 +853,7 @@ class CustomVoiceAgent:
             try:
                 result = await impl(**args)
                 if span:
-                    serialized_result = json.dumps(result, default=str)[:500]
+                    serialized_result = json.dumps(result, default=str)[:TRACE_TEXT_MAX_CHARS]
                     span.set_attribute("tool.result", serialized_result)
                     span.set_attribute("output.value", serialized_result)
                 return result
@@ -872,7 +878,7 @@ class CustomVoiceAgent:
             model=self.model,
             messages=messages,
             stream=True,
-            timeout=30.0,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
             api_key=self.llm_provider_api_key,
             tools=self.tool_registry.schemas() or None,
         ))
