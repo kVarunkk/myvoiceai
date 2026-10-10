@@ -337,151 +337,158 @@ class CustomVoiceAgent:
         dg_ws = self._dg_stt_ws
         logger.info("Connected to Deepgram STT.")
 
-        async def stable_interim_watcher():
-            while True:
-                await asyncio.sleep(0.05)
-                t = self._interim_text
-                if not t:
-                    continue
-                punct = t.rstrip().endswith((".", "?", "!"))
-                if not punct and len(_words(t)) < 3:
-                    continue  # fragment like "and"; wait for speech_final / UtteranceEnd
-                needed = self.stable_interim_secs if punct else self.stable_interim_secs_no_punct
-                if time.monotonic() - self._interim_since_ts >= needed:
-                    logger.info("Interim stable for >%.1fs, dispatching: %r", needed, t)
-                    self._stable_words = _words(t)
-                    self._stable_dispatch_ts = time.monotonic()
-                    self.transcript_accumulator += f" {t}"
-                    self._interim_text = ""
-                    await dispatch_final_transcript("stable_interim")
-    
-        async def forward_audio_to_dg():
-            while True:
-                chunk = await self.audio_in_queue.get()
-                await dg_ws.send(chunk)
-                self._last_audio_sent_ts = time.monotonic()
-                self._last_audio_sent_wall_ts = time.time_ns()
-                self.audio_in_queue.task_done()
-    
-        async def dispatch_final_transcript(source: str):
-            if not self.transcript_accumulator.strip():
-                return
-            self._last_activity_ts = time.monotonic()
-            final_text = self.transcript_accumulator.strip()
-            if self._last_audio_sent_ts:
-                logger.info(
-                    "STT time (last audio to %s): %.3fs",
-                    source, time.monotonic() - self._last_audio_sent_ts
-                )
-            self._speech_final_ts = time.monotonic()
-            logger.info("User: %s", final_text)
-            await self._send_client({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
-            self.transcript_accumulator = ""
-            turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
-            self._current_turn_span = self.tracer.start_span(
-                "voice_turn",
-                attributes={
-                    "turn.user_text": final_text,
-                    "turn.id": self.turn_counter + 1,
-                    "session.id": self.session_id,
-                    "openinference.span.kind": "CHAIN",
-                    "input.value": final_text,
-                    **self.eval_attributes,
-                },
-            ) if self.tracer else None
-
-            with self._in_turn():
-                self._record_span("stt_finalize", turn_start_ns, {
-                    "openinference.span.kind": "CHAIN",
-                    "output.value": final_text,
-                    "stt.source": source,
-                })
-
-            result = await check_input(final_text)
-            if self._current_turn_span:
-                self._current_turn_span.set_attribute("guardrail.input_allowed", result.allowed)
-            if not result.allowed:
-                self._end_turn_span({"guardrail.input_reason": result.reason or ""})
-                await self._speak_guardrail_block()
-                return
-            
-            await self.llm_prompt_queue.put(final_text)
-
-        def strip_dispatched(text: str) -> str:
-            """Drop the part of `text` that was already sent via the stable interim path."""
-            if not self._stable_words or time.monotonic() - self._stable_dispatch_ts > 5:
-                return text
-            n = len(self._stable_words)
-            if _words(text)[:n] == self._stable_words:
-                return " ".join(text.split()[n:])
-            return text    
-    
-        async def handle_dg_responses():
-            while True:
-                try:
-                    msg = await dg_ws.recv()
-                    data = json.loads(msg)
-                except json.JSONDecodeError:
-                    logger.warning("Non-JSON message from Deepgram, skipping.")
-                    continue
-    
-                msg_type = data.get("type")
-    
-                if msg_type == "UtteranceEnd":
-                    logger.info("UtteranceEnd received.")
-                    if self._interim_text and time.monotonic() - self._interim_since_ts < self.stable_interim_secs_no_punct:
-                        # Deepgram still has an unfinalized interim; wait for its final
-                        continue
-                    await dispatch_final_transcript("UtteranceEnd")
-                    self._stable_words = []
-                    self._interim_text = ""
-                    continue
-    
-                if msg_type == "Results":
-                    alt = data.get("channel", {}).get("alternatives", [{}])[0]
-                    transcript = alt.get("transcript", "")
-    
-                    if transcript:
-                        await self._send_client({
-                            "transcript_chunk": {
-                                "role": "user",
-                                "turn_id": self.turn_counter + 1,
-                                "text": f"{self.transcript_accumulator} {self._interim_text}".strip(),
-                                "replace": True,
-                            }
-                        })
-                        self._last_activity_ts = time.monotonic()
-                        tail = strip_dispatched(transcript)
-                        new_words = [w for w in _words(tail) if w not in FILLERS]
-
-                        logger.info("Interim transcript fragment: %r (is_final=%s) (speech_final=%s)", transcript, data.get("is_final"), data.get("speech_final"))
-
-                        if self.is_ai_speaking and not self.interruption_event.is_set() and not self._closing and not self.is_welcome_message_running and new_words:
-                            logger.info("Barge-in detected via transcript: %r", transcript)
-                            if self._current_turn_span:
-                                self._current_turn_span.set_attribute("turn.interrupted_by_barge_in", True)
-                            self.interruption_event.set()
-                            self.transcript_accumulator = ""
-                            await self._purge_pipeline()
-    
-                        if data.get("is_final"):
-                            if tail.strip():
-                                self.transcript_accumulator += f" {tail}"
-                            self._interim_text = ""
-                        elif tail.strip() and tail != self._interim_text:
-                            self._interim_text = tail
-                            self._interim_since_ts = time.monotonic()
-    
-                    if data.get("speech_final"):
-                        await dispatch_final_transcript("speech_final")
-    
         try:
-            await asyncio.gather(forward_audio_to_dg(), handle_dg_responses(), stable_interim_watcher())
+            await asyncio.gather(
+                self._stt_forward_audio(dg_ws),
+                self._stt_handle_responses(dg_ws),
+                self._stt_stable_interim_watcher(),
+            )
         except ConnectionClosed:
             if self._current_turn_span:
                 _mark_span_error(self._current_turn_span)
                 self._current_turn_span.set_attribute("error.source", "deepgram_stt")
             logger.warning("Deepgram STT connection closed.")
+
+    async def _stt_stable_interim_watcher(self):
+        while True:
+            await asyncio.sleep(0.05)
+            t = self._interim_text
+            if not t:
+                continue
+            punct = t.rstrip().endswith((".", "?", "!"))
+            if not punct and len(_words(t)) < 3:
+                continue  # fragment like "and"; wait for speech_final / UtteranceEnd
+            needed = self.stable_interim_secs if punct else self.stable_interim_secs_no_punct
+            if time.monotonic() - self._interim_since_ts >= needed:
+                logger.info("Interim stable for >%.1fs, dispatching: %r", needed, t)
+                self._stable_words = _words(t)
+                self._stable_dispatch_ts = time.monotonic()
+                self.transcript_accumulator += f" {t}"
+                self._interim_text = ""
+                await self._dispatch_final_transcript("stable_interim")
+
+    async def _stt_forward_audio(self, dg_ws):
+        while True:
+            chunk = await self.audio_in_queue.get()
+            await dg_ws.send(chunk)
+            self._last_audio_sent_ts = time.monotonic()
+            self._last_audio_sent_wall_ts = time.time_ns()
+            self.audio_in_queue.task_done()
+
+    async def _dispatch_final_transcript(self, source: str):
+        if not self.transcript_accumulator.strip():
+            return
+        self._last_activity_ts = time.monotonic()
+        final_text = self.transcript_accumulator.strip()
+        if self._last_audio_sent_ts:
+            logger.info(
+                "STT time (last audio to %s): %.3fs",
+                source, time.monotonic() - self._last_audio_sent_ts
+            )
+        self._speech_final_ts = time.monotonic()
+        logger.info("User: %s", final_text)
+        await self._send_client({"transcript": {"role": "user", "text": final_text, "turn_id": self.turn_counter + 1}})
+        self.transcript_accumulator = ""
+        turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
+        self._current_turn_span = self.tracer.start_span(
+            "voice_turn",
+            attributes={
+                "turn.user_text": final_text,
+                "turn.id": self.turn_counter + 1,
+                "session.id": self.session_id,
+                "openinference.span.kind": "CHAIN",
+                "input.value": final_text,
+                **self.eval_attributes,
+            },
+        ) if self.tracer else None
+
+        with self._in_turn():
+            self._record_span("stt_finalize", turn_start_ns, {
+                "openinference.span.kind": "CHAIN",
+                "output.value": final_text,
+                "stt.source": source,
+            })
+
+        result = await check_input(final_text)
+        if self._current_turn_span:
+            self._current_turn_span.set_attribute("guardrail.input_allowed", result.allowed)
+        if not result.allowed:
+            self._end_turn_span({"guardrail.input_reason": result.reason or ""})
+            await self._speak_guardrail_block()
+            return
+
+        await self.llm_prompt_queue.put(final_text)
+
+    def _strip_dispatched(self, text: str) -> str:
+        """Drop the part of `text` that was already sent via the stable interim path."""
+        if not self._stable_words or time.monotonic() - self._stable_dispatch_ts > 5:
+            return text
+        n = len(self._stable_words)
+        if _words(text)[:n] == self._stable_words:
+            return " ".join(text.split()[n:])
+        return text    
+
+    async def _stt_handle_responses(self, dg_ws):
+        while True:
+            try:
+                msg = await dg_ws.recv()
+                data = json.loads(msg)
+            except json.JSONDecodeError:
+                logger.warning("Non-JSON message from Deepgram, skipping.")
+                continue
+
+            msg_type = data.get("type")
+            if msg_type == "UtteranceEnd":
+                await self._handle_utterance_end()
+            elif msg_type == "Results":
+                await self._handle_stt_result(data)
+
+    async def _handle_utterance_end(self):
+        logger.info("UtteranceEnd received.")
+        if self._interim_text and time.monotonic() - self._interim_since_ts < self.stable_interim_secs_no_punct:
+            # Deepgram still has an unfinalized interim; wait for its final
+            return
+        await self._dispatch_final_transcript("UtteranceEnd")
+        self._stable_words = []
+        self._interim_text = ""
+
+    async def _handle_stt_result(self, data: dict):
+        alt = data.get("channel", {}).get("alternatives", [{}])[0]
+        transcript = alt.get("transcript", "")
+
+        if transcript:
+            await self._send_client({
+                "transcript_chunk": {
+                    "role": "user",
+                    "turn_id": self.turn_counter + 1,
+                    "text": f"{self.transcript_accumulator} {self._interim_text}".strip(),
+                    "replace": True,
+                }
+            })
+            self._last_activity_ts = time.monotonic()
+            tail = self._strip_dispatched(transcript)
+            new_words = [w for w in _words(tail) if w not in FILLERS]
+
+            logger.info("Interim transcript fragment: %r (is_final=%s) (speech_final=%s)", transcript, data.get("is_final"), data.get("speech_final"))
+
+            if self.is_ai_speaking and not self.interruption_event.is_set() and not self._closing and not self.is_welcome_message_running and new_words:
+                logger.info("Barge-in detected via transcript: %r", transcript)
+                if self._current_turn_span:
+                    self._current_turn_span.set_attribute("turn.interrupted_by_barge_in", True)
+                self.interruption_event.set()
+                self.transcript_accumulator = ""
+                await self._purge_pipeline()
+
+            if data.get("is_final"):
+                if tail.strip():
+                    self.transcript_accumulator += f" {tail}"
+                self._interim_text = ""
+            elif tail.strip() and tail != self._interim_text:
+                self._interim_text = tail
+                self._interim_since_ts = time.monotonic()
+
+        if data.get("speech_final"):
+            await self._dispatch_final_transcript("speech_final")
 
     async def llm_loop(self):
         """Task 3: streams prompts to the LLM via LiteLLM, splits the response into
@@ -652,54 +659,54 @@ class CustomVoiceAgent:
         self._dg_tts_ws = await _connect_deepgram(DEEPGRAM_TTS_URL.format(tts_model=self.tts_model), self.deepgram_api_key)
         tts_ws = self._dg_tts_ws
 
-        async def feed_text_to_tts():
-            while True:
-                item = await self.tts_text_queue.get()
-                logger.info("feed_text_to_tts dequeued at t=%.3f: %r", time.monotonic(), item)
-                if isinstance(item, dict) and item.get("flush"):
-                    logger.info("Sending Flush to Deepgram TTS.")
-                    await tts_ws.send(json.dumps({"type": "Flush"}))
-                elif not self.interruption_event.is_set():
-                    if self._tts_first_send_ts is None:
-                        self._tts_first_send_ts = time.monotonic()
-                        self._tts_span_start_ns = time.time_ns()
-                    with self._in_turn(), self._span("tts_stream", {
-                        "tts.text_len": len(item),
-                        "openinference.span.kind": "CHAIN",
-                        "input.value": item,
-                    }, require_turn=True):
-                        await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
-                    logger.info("Sending text to Deepgram TTS at t=%.3f: %r", time.monotonic(), item)
-                self.tts_text_queue.task_done()
-
-        async def harvest_audio_from_tts():
-            while True:
-                msg = await tts_ws.recv()
-                if isinstance(msg, bytes) and not self.interruption_event.is_set():
-                    if self._tts_first_send_ts is not None:
-                        logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
-                        if self._current_turn_span and self._tts_span_start_ns:
-                            with self._in_turn():
-                                self._record_span("tts_generation", self._tts_span_start_ns, {
-                                    "openinference.span.kind": "CHAIN",
-                                })
-                        self._tts_first_send_ts = None
-                        self._tts_span_start_ns = None
-                    await self.audio_out_queue.put(msg)
-                else:
-                    try:
-                        data = json.loads(msg)
-                        if data.get("type") == "Flushed":
-                            await self.audio_out_queue.put(_AUDIO_UTTERANCE_END)
-                            self._tts_flush_event.set()
-                            self._end_turn_span()
-                    except json.JSONDecodeError:
-                        pass
-
         try:
-            await asyncio.gather(feed_text_to_tts(), harvest_audio_from_tts())
+            await asyncio.gather(self._tts_feed_text(tts_ws), self._tts_harvest_audio(tts_ws))
         except ConnectionClosed:
             logger.warning("Deepgram TTS connection closed.")
+
+    async def _tts_feed_text(self, tts_ws):
+        while True:
+            item = await self.tts_text_queue.get()
+            logger.info("feed_text_to_tts dequeued at t=%.3f: %r", time.monotonic(), item)
+            if isinstance(item, dict) and item.get("flush"):
+                logger.info("Sending Flush to Deepgram TTS.")
+                await tts_ws.send(json.dumps({"type": "Flush"}))
+            elif not self.interruption_event.is_set():
+                if self._tts_first_send_ts is None:
+                    self._tts_first_send_ts = time.monotonic()
+                    self._tts_span_start_ns = time.time_ns()
+                with self._in_turn(), self._span("tts_stream", {
+                    "tts.text_len": len(item),
+                    "openinference.span.kind": "CHAIN",
+                    "input.value": item,
+                }, require_turn=True):
+                    await tts_ws.send(json.dumps({"type": "Speak", "text": item}))
+                logger.info("Sending text to Deepgram TTS at t=%.3f: %r", time.monotonic(), item)
+            self.tts_text_queue.task_done()
+
+    async def _tts_harvest_audio(self, tts_ws):
+        while True:
+            msg = await tts_ws.recv()
+            if isinstance(msg, bytes) and not self.interruption_event.is_set():
+                if self._tts_first_send_ts is not None:
+                    logger.info("TTS time to first audio: %.3fs", time.monotonic() - self._tts_first_send_ts)
+                    if self._current_turn_span and self._tts_span_start_ns:
+                        with self._in_turn():
+                            self._record_span("tts_generation", self._tts_span_start_ns, {
+                                "openinference.span.kind": "CHAIN",
+                            })
+                    self._tts_first_send_ts = None
+                    self._tts_span_start_ns = None
+                await self.audio_out_queue.put(msg)
+            else:
+                try:
+                    data = json.loads(msg)
+                    if data.get("type") == "Flushed":
+                        await self.audio_out_queue.put(_AUDIO_UTTERANCE_END)
+                        self._tts_flush_event.set()
+                        self._end_turn_span()
+                except json.JSONDecodeError:
+                    pass
 
     async def write_client_speaker_loop(self):
         while True:
