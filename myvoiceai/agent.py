@@ -517,13 +517,9 @@ class CustomVoiceAgent:
     
             messages = self._build_messages()
     
-            full_reply = ""
-
             with self._in_turn(), self._span("llm_stream", {
                 "llm.model": self.model,
                 "llm.model_name": self.model,
-                "openinference.span.kind": "LLM",
-                "input.value": prompt,
             }) as llm_span:
                 full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
 
@@ -548,16 +544,7 @@ class CustomVoiceAgent:
                     {"role": "assistant", "content": full_reply}
                 )
                 await self._send_client({"transcript": {"role": "assistant", "text": spoken, "turn_id": self.turn_counter + 1}})
-                self.turn_counter += 1
-                await self._send_client({
-                    "turn": {
-                        "turn_id": self.turn_counter,
-                        "timestamp": time.time(),
-                        "user": prompt,
-                        "assistant": spoken,
-                        "interrupted": False,
-                    }
-                })
+                await self._finish_turn(prompt, spoken, interrupted=False)
     
             self.llm_prompt_queue.task_done()
 
@@ -607,21 +594,13 @@ class CustomVoiceAgent:
             llm_span.set_attribute("input.value", prompt)
         try:
             current_messages = messages
-            hop = 0
-            while hop < MAX_TOOL_HOPS:
+            for _ in range(MAX_TOOL_HOPS):
                 reply_part, tool_calls = await self._stream_completion(current_messages)
                 full_reply += reply_part
 
                 if self.interruption_event.is_set():
                     self.conversation_history.append({"role": "assistant", "content": "No response."})
-                    self.turn_counter += 1
-                    await self._send_client({
-                        "turn": {
-                            "turn_id": self.turn_counter, "timestamp": time.time(),
-                            "user": prompt, "assistant": full_reply if full_reply.strip() else None,
-                            "interrupted": True,
-                        }
-                    })
+                    await self._finish_turn(prompt, full_reply if full_reply.strip() else None, interrupted=True)
                     break
 
                 if not tool_calls:
@@ -631,26 +610,21 @@ class CustomVoiceAgent:
                 if not ok:
                     break
                 current_messages = self._build_messages()
-                hop += 1
                 
             if llm_span:
                 llm_span.set_attribute("llm.response_text", full_reply[:500])
                 llm_span.set_attribute("output.value", full_reply[:500])
             logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._llm_request_ts or 0))
 
-        except exceptions.APIError:
+        except Exception as e:
             if llm_span:
-                llm_span.record_exception(traceback_exc := __import__("sys").exc_info()[1])
-            if StatusCode and llm_span:
-                llm_span.set_status(StatusCode.ERROR)
-            logger.exception("LLM request failed.")
-        except Exception:
-            if llm_span:
-                llm_span.record_exception(__import__("sys").exc_info()[1])
-            if StatusCode and llm_span:    
-                llm_span.set_status(StatusCode.ERROR)
-            logger.exception("Unexpected error during LLM streaming.")
-        return full_reply                             
+                llm_span.record_exception(e)
+                _mark_span_error(llm_span)
+            if isinstance(e, exceptions.APIError):
+                logger.exception("LLM request failed.")
+            else:
+                logger.exception("Unexpected error during LLM streaming.")
+        return full_reply
        
 
     async def deepgram_tts_loop(self):
@@ -861,6 +835,19 @@ class CustomVoiceAgent:
 
     def _build_messages(self) -> list[dict]:
         return [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+
+    async def _finish_turn(self, user: str, assistant: str | None, interrupted: bool):
+        """Advances the turn counter and sends the turn record to the client."""
+        self.turn_counter += 1
+        await self._send_client({
+            "turn": {
+                "turn_id": self.turn_counter,
+                "timestamp": time.time(),
+                "user": user,
+                "assistant": assistant,
+                "interrupted": interrupted,
+            }
+        })
 
     def _in_turn(self):
         """Makes the current turn span the parent of spans started inside it."""
