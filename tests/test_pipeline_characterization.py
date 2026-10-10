@@ -11,6 +11,7 @@ import time
 import unittest
 from importlib.util import find_spec
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from myvoiceai import agent as agent_module
@@ -150,7 +151,7 @@ class FakeLLM:
 
 
 def make_agent(client, *, tool_registry=None, **overrides):
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         client_websocket=client,
         system_prompt="SYS.",
         max_session_seconds=60,
@@ -602,13 +603,13 @@ class TracingSpanTests(PipelineTestCase):
 
     def span_tree(self):
         spans = self.exporter.get_finished_spans()
-        by_id = {s.context.span_id: s for s in spans}
+        by_id = {s.context.span_id: s for s in spans if s.context}
         return sorted(
             (
                 (
                     s.name,
                     by_id[s.parent.span_id].name if s.parent and s.parent.span_id in by_id else None,
-                    dict(s.attributes),
+                    dict(s.attributes or {}),
                 )
                 for s in spans
             ),
@@ -670,8 +671,8 @@ class TracingSpanTests(PipelineTestCase):
         llm_span = [s for s in self.exporter.get_finished_spans() if s.name == "llm_stream"][0]
         self.assertEqual(llm_span.status.status_code, StatusCode.ERROR)
         self.assertEqual([ev.name for ev in llm_span.events], ["exception"])
-        self.assertEqual(llm_span.events[0].attributes["exception.message"], "provider down")
-        self.assertEqual(dict(llm_span.attributes), {
+        self.assertEqual((llm_span.events[0].attributes or {})["exception.message"], "provider down")
+        self.assertEqual(dict(llm_span.attributes or {}), {
             "llm.model": "mock-model",
             "llm.model_name": "mock-model",
             "openinference.span.kind": "LLM",
@@ -707,7 +708,7 @@ class TracingSpanTests(PipelineTestCase):
         blocked = [s for s in tree if s[0] == "voice_turn" and s[2]["turn.id"] == 2]
         self.assertEqual(len(blocked), 1)
         self.assertEqual(blocked[0][2]["guardrail.input_allowed"], False)
-        self.assertTrue(blocked[0][2]["guardrail.input_reason"].startswith("prompt_injection:"))
+        self.assertTrue(str(blocked[0][2]["guardrail.input_reason"]).startswith("prompt_injection:"))
 
 
 if __name__ == "__main__":
