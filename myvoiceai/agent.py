@@ -562,6 +562,7 @@ class CustomVoiceAgent:
                         self._current_turn_span.set_attribute("guardrail.output_allowed", result.allowed)
                     if result.allowed:
                         await self.tts_text_queue.put(final_chunk)
+                        self._any_output_sent = True
                         await self._emit_agent_chunk(final_chunk)
                     else:
                         logger.info("Output guardrail blocked final chunk: %s", result.reason)

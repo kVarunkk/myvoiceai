@@ -335,7 +335,7 @@ class ConversationTurnTests(PipelineTestCase):
         self.assertEqual(self.agent.conversation_history, [])
         await self.end_session()
 
-    async def test_output_guardrail_blocks_chunk_and_speaks_block_message(self):
+    async def test_output_guardrail_blocks_chunk_but_speaks_the_rest(self):
         llm = FakeLLM([text_chunk("Well shit."), text_chunk(" Ok")])
         await self.start_session(llm)
 
@@ -343,16 +343,22 @@ class ConversationTurnTests(PipelineTestCase):
         await self.wait_turn_done()
 
         # "Well shit." is blocked; the leftover " Ok" is spoken (unstripped) by the
-        # final-chunk path, and since no chunk set _any_output_sent the block
-        # message follows.
-        self.assertEqual(
-            self.tts.spoken,
-            [GREETING, "FLUSH", " Ok", GUARDRAIL_BLOCK_MESSAGE, "FLUSH"],
-        )
+        # final-chunk path, so no block message is needed.
+        self.assertEqual(self.tts.spoken, [GREETING, "FLUSH", " Ok", "FLUSH"])
         await self.end_session()
 
-    async def test_short_unpunctuated_reply_is_followed_by_block_message(self):
-        """Known quirk 1 (preserved on purpose, see REFACTOR_PLAN.md)."""
+    async def test_fully_blocked_reply_speaks_block_message(self):
+        llm = FakeLLM([text_chunk("Well shit.")])
+        await self.start_session(llm)
+
+        await self.user_says("hello")
+        await wait_until(lambda: GUARDRAIL_BLOCK_MESSAGE in self.tts.spoken, msg="block message")
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.tts.spoken, [GREETING, "FLUSH", GUARDRAIL_BLOCK_MESSAGE, "FLUSH"])
+        await self.end_session()
+
+    async def test_short_unpunctuated_reply_is_spoken_without_block_message(self):
         llm = FakeLLM([text_chunk("Sure thing")])
         await self.start_session(llm)
 
@@ -361,7 +367,7 @@ class ConversationTurnTests(PipelineTestCase):
 
         self.assertEqual(
             self.tts.spoken,
-            [GREETING, "FLUSH", "Sure thing", GUARDRAIL_BLOCK_MESSAGE, "FLUSH"],
+            [GREETING, "FLUSH", "Sure thing", "FLUSH"],
         )
         self.assertEqual(self.client.json_of("transcript")[-1]["text"], "Sure thing")
         await self.end_session()
