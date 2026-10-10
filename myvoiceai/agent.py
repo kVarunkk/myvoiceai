@@ -1123,7 +1123,6 @@ async def run_voice_session(
             eval_run_id=eval_run_id,
             eval_case_id=eval_case_id,
             eval_variant=eval_variant,
-            **kwargs,
         )
         await agent.run()
     except asyncio.CancelledError:
