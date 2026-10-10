@@ -6,7 +6,7 @@ import random
 import re
 import time
 import uuid
-from typing import NotRequired, Sequence, TypedDict, cast
+from typing import Sequence, cast
 
 import websockets
 from litellm import CustomStreamWrapper, acompletion, exceptions
@@ -41,21 +41,9 @@ from myvoiceai.lib.constants import (
     TOOL_FILLER_PHRASES,
 )
 from myvoiceai.tools import ToolRegistry, get_default_registry
+from myvoiceai.tracing import OTLPExporterConfig, create_tracer_provider, mark_span_error, trace
 from myvoiceai.utils.guardrails import check_input, check_output
 from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
-
-
-class OTLPExporterConfig(TypedDict):
-    endpoint: str
-    headers: NotRequired[dict[str, str]]
-
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import StatusCode
-except Exception:
-    # Tracing extra not installed: self.tracer stays None, so no span is ever created.
-    trace = None
-    StatusCode = None
 
 logger = logging.getLogger("voice_agent")
 _AUDIO_UTTERANCE_END = object()
@@ -70,9 +58,6 @@ async def _connect_deepgram(url: str, api_key: str | None):
     except TypeError:
         return await websockets.connect(url, extra_headers=headers)
 
-def _mark_span_error(span) -> None:
-    if StatusCode is not None:
-        span.set_status(StatusCode.ERROR)
 
 def _words(s: str) -> list[str]:
     return re.sub(r"[^\w\s']", "", s).lower().split()
@@ -205,44 +190,16 @@ class CustomVoiceAgent:
         service_version: str | None,
         deployment_environment: str | None,
     ):
-        try:
-            from opentelemetry.sdk.resources import Resource
-            from opentelemetry.sdk.trace import TracerProvider
-            from opentelemetry.sdk.trace.export import BatchSpanProcessor
-            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-
-            resource_attributes = {
-                "service.name": service_name,
-                "openinference.project.name": project_name,
-            }
-            if service_version:
-                resource_attributes["service.version"] = service_version
-            if deployment_environment:
-                resource_attributes["deployment.environment"] = deployment_environment
-            resource = Resource.create(resource_attributes)
-            provider = TracerProvider(resource=resource)
-            for exporter_index, exporter_config in enumerate(exporters_config or (), start=1):
-                exporter_endpoint = exporter_config.get("endpoint")
-                if not exporter_endpoint:
-                    raise ValueError("Each OTLP exporter configuration needs an endpoint.")
-                exporter_headers = exporter_config.get("headers", {})
-                if not isinstance(exporter_headers, dict):
-                    raise TypeError("OTLP exporter headers must be a dictionary.")
-                logger.info("Initializing OTLP exporter %d.", exporter_index)
-                exporter = OTLPSpanExporter(
-                    endpoint=exporter_endpoint,
-                    headers=exporter_headers,
-                )
-                provider.add_span_processor(BatchSpanProcessor(exporter))
-            self._tracer_provider = provider
-            return provider.get_tracer("myvoiceai_tracer")
-        except Exception:
-            logger.warning(
-                "Tracing requested but OpenTelemetry SDK/exporter initialization failed; "
-                "install myvoiceai[observability] and check the endpoint configuration.",
-                exc_info=True,
-            )
+        self._tracer_provider = create_tracer_provider(
+            exporters_config,
+            service_name,
+            project_name,
+            service_version,
+            deployment_environment,
+        )
+        if self._tracer_provider is None:
             return None
+        return self._tracer_provider.get_tracer("myvoiceai_tracer")
 
     async def run(self):
         """Orchestrates system loops and guarantees cleanup on exit,
@@ -345,7 +302,7 @@ class CustomVoiceAgent:
             )
         except ConnectionClosed:
             if self._current_turn_span:
-                _mark_span_error(self._current_turn_span)
+                mark_span_error(self._current_turn_span)
                 self._current_turn_span.set_attribute("error.source", "deepgram_stt")
             logger.warning("Deepgram STT connection closed.")
 
@@ -619,7 +576,7 @@ class CustomVoiceAgent:
         except Exception as e:
             if llm_span:
                 llm_span.record_exception(e)
-                _mark_span_error(llm_span)
+                mark_span_error(llm_span)
             if isinstance(e, exceptions.APIError):
                 logger.exception("LLM request failed.")
             else:
@@ -901,7 +858,7 @@ class CustomVoiceAgent:
             except Exception as e:
                 if span:
                     span.record_exception(e)
-                    _mark_span_error(span)
+                    mark_span_error(span)
                 return {"error": str(e)}
 
 
