@@ -2,7 +2,19 @@
 
 Notable changes to `myvoiceai` are documented here by release. Versions 0.0.4 and later correspond to repository release tags.
 
-## [0.0.9] - Unreleased
+## [0.0.10]
+
+### Fixed
+
+- `run_voice_session()` no longer fails every session when it receives an unsupported keyword argument, such as the `otel_exporter_endpoint` and `otel_exporter_headers` arguments removed in 0.0.9. Unsupported arguments are logged and ignored, as documented.
+- A short reply without sentence or clause punctuation (for example "Sure thing") is no longer followed by the guardrail block message. The block message is now spoken only when no part of the reply was spoken.
+
+### Changed
+
+- Internal refactor of `CustomVoiceAgent` with no change to the public API. OpenTelemetry setup moved to the new `myvoiceai.tracing` module; `OTLPExporterConfig` can still be imported from `myvoiceai.agent`.
+- Timing and size values used by the pipeline are now named constants in `myvoiceai.lib.constants`, with unchanged values.
+
+## [0.0.9]
 
 ### Breaking changes
 
