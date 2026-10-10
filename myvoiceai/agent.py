@@ -70,6 +70,10 @@ async def _connect_deepgram(url: str, api_key: str | None):
     except TypeError:
         return await websockets.connect(url, extra_headers=headers)
 
+def _mark_span_error(span) -> None:
+    if StatusCode is not None:
+        span.set_status(StatusCode.ERROR)
+
 def _words(s: str) -> list[str]:
     return re.sub(r"[^\w\s']", "", s).lower().split()
 
@@ -475,7 +479,7 @@ class CustomVoiceAgent:
             await asyncio.gather(forward_audio_to_dg(), handle_dg_responses(), stable_interim_watcher())
         except ConnectionClosed:
             if self._current_turn_span:
-                self._current_turn_span.set_status(StatusCode.ERROR)
+                _mark_span_error(self._current_turn_span)
                 self._current_turn_span.set_attribute("error.source", "deepgram_stt")
             logger.warning("Deepgram STT connection closed.")
 
@@ -853,7 +857,7 @@ class CustomVoiceAgent:
 
     def _in_turn(self):
         """Makes the current turn span the parent of spans started inside it."""
-        if self._current_turn_span is None:
+        if self._current_turn_span is None or trace is None:
             return contextlib.nullcontext()
         return trace.use_span(self._current_turn_span, end_on_exit=False)
 
@@ -903,7 +907,7 @@ class CustomVoiceAgent:
             except Exception as e:
                 if span:
                     span.record_exception(e)
-                    span.set_status(StatusCode.ERROR)
+                    _mark_span_error(span)
                 return {"error": str(e)}
 
 
