@@ -16,6 +16,7 @@ from websockets.exceptions import ConnectionClosed
 from myvoiceai.lib.constants import (
     BASE_SYSTEM_PROMPT,
     CLAUSE_BOUNDARY_CHARS,
+    DEEPGRAM_MIP_OPT_OUT_PARAM,
     DEEPGRAM_STT_MODEL,
     DEEPGRAM_STT_URL,
     DEEPGRAM_TTS_MODEL,
@@ -26,10 +27,14 @@ from myvoiceai.lib.constants import (
     DEFAULT_INACTIVITY_TIMEOUT_SECONDS,
     DEFAULT_MAX_SESSION_SECONDS,
     DEFAULT_UTTERANCE_END,
+    END_INTERVIEW_FALLBACK_MESSAGE,
+    END_INTERVIEW_TOOL_NAME,
+    END_INTERVIEW_TOOL_SCHEMA,
     FILLERS,
     GOODBYE_TTS_GRACE_SECONDS,
     GUARDRAIL_BLOCK_MESSAGE,
     INACTIVITY_MESSAGE,
+    INACTIVITY_PROMPT_MESSAGE,
     LLM_MODEL,
     LLM_REQUEST_TIMEOUT_SECONDS,
     MAX_BUFFER_CHARS_BEFORE_FORCED_FLUSH,
@@ -46,6 +51,7 @@ from myvoiceai.lib.constants import (
     TOOL_FILLER_PHRASES,
     TRACE_TEXT_MAX_CHARS,
 )
+from myvoiceai.result import EndReason, SessionResult
 from myvoiceai.tools import ToolRegistry, get_default_registry
 from myvoiceai.tracing import OTLPExporterConfig, create_tracer_provider, mark_span_error, trace
 from myvoiceai.utils.guardrails import check_input, check_output
@@ -53,6 +59,18 @@ from myvoiceai.utils.strip_markdown import strip_markdown_for_speech
 
 logger = logging.getLogger("voice_agent")
 _AUDIO_UTTERANCE_END = object()
+
+# Span attributes that carry conversation text (transcripts, replies, tool
+# arguments and results, guardrail matches). Left out when trace_content is off.
+CONTENT_SPAN_ATTRIBUTES = frozenset({
+    "turn.user_text",
+    "input.value",
+    "output.value",
+    "llm.response_text",
+    "tool.args",
+    "tool.result",
+    "guardrail.input_reason",
+})
 
 async def _connect_deepgram(url: str, api_key: str | None):
     """Connect to a Deepgram websocket, tolerating both old and new
@@ -69,6 +87,9 @@ def _words(s: str) -> list[str]:
     return re.sub(r"[^\w\s']", "", s).lower().split()
 
 class CustomVoiceAgent:
+    # Class-level default so helpers work on agents built without __init__ (tests).
+    trace_content = True
+
     def __init__(
         self, 
         client_websocket, 
@@ -98,12 +119,21 @@ class CustomVoiceAgent:
         eval_run_id: str | None = None,
         eval_case_id: str | None = None,
         eval_variant: str | None = None,
+        stt_privacy_opt_out: bool = False,
+        inactivity_prompt_seconds: float | None = None,
+        inactivity_prompt_message: str = INACTIVITY_PROMPT_MESSAGE,
+        trace_content: bool = True,
+        end_interview_tool: bool = False,
     ):
         self.client_ws = client_websocket
         self.tracing = tracing
+        self.trace_content = trace_content
         self.model = model
         self.llm_provider_api_key = llm_provider_api_key
-        self.tool_registry = tool_registry 
+        self.tool_registry = tool_registry
+        if end_interview_tool:
+            self.tool_registry = tool_registry.copy()
+            self.tool_registry.register(END_INTERVIEW_TOOL_NAME, END_INTERVIEW_TOOL_SCHEMA, self._end_interview)
         self.session_id = session_id or str(uuid.uuid4())
         self.eval_attributes = {
             key: value
@@ -117,6 +147,7 @@ class CustomVoiceAgent:
         self.deepgram_api_key = deepgram_api_key
         self.stt_model = stt_model
         self.tts_model = tts_model
+        self.stt_privacy_opt_out = stt_privacy_opt_out
         if not self.deepgram_api_key:
             raise RuntimeError(
                 "Pass the Deepgram API key."
@@ -168,7 +199,12 @@ class CustomVoiceAgent:
         self.inactivity_timeout_seconds = inactivity_timeout_seconds
         self.max_duration_message = max_duration_message
         self.inactivity_message = inactivity_message
+        self.inactivity_prompt_seconds = inactivity_prompt_seconds
+        self.inactivity_prompt_message = inactivity_prompt_message
         self._last_activity_ts = time.monotonic()
+        # The activity timestamp the last nudge was for: one nudge per silence.
+        self._nudged_for_activity_ts: float | None = None
+        self._nudge_playing = False
 
         self._closing = False
         self._session_end_event = asyncio.Event()
@@ -187,6 +223,25 @@ class CustomVoiceAgent:
         self._stable_dispatch_ts = 0.0
 
         self._spoken_text_parts: list[str] = []
+
+        # end_interview: set by the tool, acted on once the closing line is spoken.
+        self._end_requested = False
+        # Counters for waiting on the last of the speech (see _end_after_speech).
+        self._tts_flushes_sent = 0
+        self._tts_flushes_received = 0
+        self._flushes_sent_at_clear = 0
+        self._utterance_ends_sent = 0
+        self._playback_acked_through = 0
+
+        # Reported back by run() as a SessionResult.
+        self.turns: list[dict] = []
+        self.end_reason: EndReason | None = None
+
+    def _set_end_reason(self, reason: EndReason):
+        """Records why the session ended. The first reason wins, so a
+        disconnect during a goodbye doesn't replace the goodbye's reason."""
+        if self.end_reason is None:
+            self.end_reason = reason
 
     def _initialize_tracer(
         self,
@@ -207,10 +262,13 @@ class CustomVoiceAgent:
             return None
         return self._tracer_provider.get_tracer("myvoiceai_tracer")
 
-    async def run(self):
+    async def run(self) -> SessionResult:
         """Orchestrates system loops and guarantees cleanup on exit,
         whether that exit is a client disconnect or an unhandled error
-        in any one of the loops."""
+        in any one of the loops. Returns the turns and why the session
+        ended; errors are reported in the result, not raised."""
+        started_at = time.time()
+        started_mono = time.monotonic()
         self._tasks = [
             asyncio.create_task(self.read_client_mic_loop(), name="mic_in"),
             asyncio.create_task(self.deepgram_stt_loop(), name="stt"),
@@ -228,6 +286,7 @@ class CustomVoiceAgent:
             
             for task in done:
                 if task.exception():
+                    self._set_end_reason("error")
                     logger.exception(
                         "Task %s failed",
                         task.get_name(),
@@ -237,9 +296,21 @@ class CustomVoiceAgent:
             if self._closing:
                 await self._session_end_event.wait()
         except Exception:
-            logger.exception("Voice session failed (session_id=%s)", self.session_id)        
+            self._set_end_reason("error")
+            logger.exception("Voice session failed (session_id=%s)", self.session_id)
         finally:
             await self._shutdown()
+
+        # A loop that returned without saying why (e.g. a Deepgram socket closing) is an error.
+        self._set_end_reason("error")
+        duration = time.monotonic() - started_mono
+        return SessionResult(
+            turns=list(self.turns),
+            end_reason=cast(EndReason, self.end_reason),
+            started_at=started_at,
+            ended_at=started_at + duration,
+            duration_seconds=duration,
+        )
 
     async def _shutdown(self):
         self._cancel_tool_tasks()
@@ -256,7 +327,7 @@ class CustomVoiceAgent:
                 except Exception:
                     pass
         try:
-            await self.client_ws.close()
+            await self.client_ws.close(code=1000)
         except Exception:
             pass        
         if self._tracer_provider is not None:
@@ -285,17 +356,28 @@ class CustomVoiceAgent:
                         continue
                     # IMPORTANT: client has to send the playback_complete event
                     if data.get("control") == "playback_complete":
-                        self._last_activity_ts = time.monotonic()
+                        # The client acks once its buffer drains, so one ack covers every utterance_end so far.
+                        self._playback_acked_through = self._utterance_ends_sent
+                        # The nudge finishing isn't activity: the silence it asked about goes on.
+                        if self._nudge_playing:
+                            self._nudge_playing = False
+                        else:
+                            self._last_activity_ts = time.monotonic()
                         self.is_ai_speaking = False
                         self._playback_complete_event.set()
                         self.is_welcome_message_running = False
         except (WebSocketDisconnect, RuntimeError) as e:
+            self._set_end_reason("client_disconnect")
             logger.info("Client connection ended (mic loop): %r", e)      
 
     # sends audio to deepgram and receives text via websocket
+    def _stt_url(self) -> str:
+        url = DEEPGRAM_STT_URL.format(stt_model=self.stt_model, endpointing=self.endpointing, utterance_end=self.utterance_end)
+        return url + DEEPGRAM_MIP_OPT_OUT_PARAM if self.stt_privacy_opt_out else url
+
     async def deepgram_stt_loop(self):
         """Task 2: full-duplex pipe driving live Deepgram STT."""
-        self._dg_stt_ws = await _connect_deepgram(DEEPGRAM_STT_URL.format(stt_model=self.stt_model, endpointing = self.endpointing, utterance_end = self.utterance_end), self.deepgram_api_key)
+        self._dg_stt_ws = await _connect_deepgram(self._stt_url(), self.deepgram_api_key)
 
         dg_ws = self._dg_stt_ws
         logger.info("Connected to Deepgram STT.")
@@ -355,14 +437,14 @@ class CustomVoiceAgent:
         turn_start_ns = self._last_audio_sent_wall_ts if self._last_audio_sent_wall_ts else time.time_ns()
         self._current_turn_span = self.tracer.start_span(
             "voice_turn",
-            attributes={
+            attributes=self._traced({
                 "turn.user_text": final_text,
                 "turn.id": self.turn_counter + 1,
                 "session.id": self.session_id,
                 "openinference.span.kind": "CHAIN",
                 "input.value": final_text,
                 **self.eval_attributes,
-            },
+            }),
         ) if self.tracer else None
 
         with self._in_turn():
@@ -487,7 +569,7 @@ class CustomVoiceAgent:
                 full_reply = await self.llm_call(llm_span=llm_span, messages=messages, prompt=prompt)
 
             if self._current_turn_span and full_reply.strip():
-                self._current_turn_span.set_attribute("output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
+                self._set_span_attribute(self._current_turn_span, "output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
                         
     
           
@@ -495,12 +577,17 @@ class CustomVoiceAgent:
                 if self.sentence_buffer.strip() and not self.interruption_event.is_set():
                     await self._emit_checked_chunk(strip_markdown_for_speech(self.sentence_buffer), flush=False)
 
-                if not self._any_output_sent and not self.interruption_event.is_set():
+                if self._end_requested and not self._any_output_sent:
+                    # Ended without a closing line: say one, and keep the candidate's last answer.
+                    full_reply = END_INTERVIEW_FALLBACK_MESSAGE
+                    self.is_ai_speaking = True
+                    await self._speak(END_INTERVIEW_FALLBACK_MESSAGE)
+                elif not self._any_output_sent and not self.interruption_event.is_set():
                     await self._speak_guardrail_block()
                 else:
                     await self.tts_text_queue.put({"flush": True})
             self.sentence_buffer = ""
-    
+
             if full_reply.strip() and not self.interruption_event.is_set():
                 spoken = " ".join(self._spoken_text_parts).strip() or full_reply
                 self.conversation_history.append(
@@ -508,8 +595,12 @@ class CustomVoiceAgent:
                 )
                 await self._send_client({"transcript": {"role": "assistant", "text": spoken, "turn_id": self.turn_counter + 1}})
                 await self._finish_turn(prompt, spoken, interrupted=False)
-    
+
             self.llm_prompt_queue.task_done()
+
+            if self._end_requested:
+                await self._end_after_speech()
+                return
 
     async def _buffer_and_dispatch(self, token: str):
         self.sentence_buffer += token
@@ -554,7 +645,7 @@ class CustomVoiceAgent:
         full_reply = ""
         if llm_span:
             llm_span.set_attribute("openinference.span.kind", "LLM")
-            llm_span.set_attribute("input.value", prompt)
+            self._set_span_attribute(llm_span, "input.value", prompt)
         try:
             current_messages = messages
             for _ in range(MAX_TOOL_HOPS):
@@ -570,18 +661,18 @@ class CustomVoiceAgent:
                     break
 
                 ok = await self._execute_tool_hop(tool_calls)
-                if not ok:
+                if not ok or self._end_requested:
                     break
                 current_messages = self._build_messages()
                 
             if llm_span:
-                llm_span.set_attribute("llm.response_text", full_reply[:TRACE_TEXT_MAX_CHARS])
-                llm_span.set_attribute("output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
+                self._set_span_attribute(llm_span, "llm.response_text", full_reply[:TRACE_TEXT_MAX_CHARS])
+                self._set_span_attribute(llm_span, "output.value", full_reply[:TRACE_TEXT_MAX_CHARS])
             logger.info("LLM total time to final token: %.3fs", time.monotonic() - (self._llm_request_ts or 0))
 
         except Exception as e:
             if llm_span:
-                llm_span.record_exception(e)
+                self._record_span_exception(llm_span, e)
                 mark_span_error(llm_span)
             if isinstance(e, exceptions.APIError):
                 logger.exception("LLM request failed.")
@@ -608,6 +699,7 @@ class CustomVoiceAgent:
             if isinstance(item, dict) and item.get("flush"):
                 logger.info("Sending Flush to Deepgram TTS.")
                 await tts_ws.send(json.dumps({"type": "Flush"}))
+                self._tts_flushes_sent += 1
             elif not self.interruption_event.is_set():
                 if self._tts_first_send_ts is None:
                     self._tts_first_send_ts = time.monotonic()
@@ -639,9 +731,13 @@ class CustomVoiceAgent:
                 try:
                     data = json.loads(msg)
                     if data.get("type") == "Flushed":
+                        self._tts_flushes_received += 1
                         await self.audio_out_queue.put(_AUDIO_UTTERANCE_END)
                         self._tts_flush_event.set()
                         self._end_turn_span()
+                    elif data.get("type") == "Cleared":
+                        # Flushes sent before the Clear won't be answered any more.
+                        self._tts_flushes_received = max(self._tts_flushes_received, self._flushes_sent_at_clear)
                 except json.JSONDecodeError:
                     pass
 
@@ -651,15 +747,18 @@ class CustomVoiceAgent:
             try:
                 if audio_payload is _AUDIO_UTTERANCE_END:
                     await self.client_ws.send_json({"control": "utterance_end"})
+                    self._utterance_ends_sent += 1
                     continue
 
                 if not self.interruption_event.is_set():
                     self.is_ai_speaking = True
                     await self.client_ws.send_bytes(audio_payload)
             except WebSocketDisconnect:
+                self._set_end_reason("client_disconnect")
                 logger.info("Client disconnected (speaker loop).")
                 return
             except RuntimeError:
+                self._set_end_reason("client_disconnect")
                 logger.info("Client websocket not ready or closed (speaker loop).")
                 return
             finally:
@@ -671,18 +770,35 @@ class CustomVoiceAgent:
         session_start = time.monotonic()
         while True:
             await asyncio.sleep(1)
-    
+
+            if self._closing:
+                continue
+
             now = time.monotonic()
     
             if now - session_start > self.max_session_seconds:
                 logger.info("Max session duration (%.0fs) reached, closing.", self.max_session_seconds)
+                self._set_end_reason("time_limit")
                 await self._say_goodbye_and_close(self.max_duration_message)
                 return
     
             if (now - self._last_activity_ts > self.inactivity_timeout_seconds) and not self.is_ai_speaking:
                 logger.info("Inactivity timeout (%.0fs) reached, closing.", self.inactivity_timeout_seconds)
+                self._set_end_reason("inactivity")
                 await self._say_goodbye_and_close(self.inactivity_message)
                 return
+
+            if (
+                self.inactivity_prompt_seconds is not None
+                and self._nudged_for_activity_ts != self._last_activity_ts
+                and now - self._last_activity_ts > self.inactivity_prompt_seconds
+                and not self.is_ai_speaking
+            ):
+                logger.info("Inactivity prompt (%.0fs) reached, nudging.", self.inactivity_prompt_seconds)
+                self._nudged_for_activity_ts = self._last_activity_ts
+                self._nudge_playing = True
+                self.is_ai_speaking = True
+                await self._speak(self.inactivity_prompt_message)
 
     async def _say_goodbye_and_close(self, text: str):
         """Halts any in-flight LLM/TTS output, then speaks a final message
@@ -735,6 +851,36 @@ class CustomVoiceAgent:
         self._session_end_event.set()    
     
 
+    async def _end_interview(self) -> dict:
+        """The end_interview tool. The session closes once the closing line has played."""
+        if self._end_requested:
+            return {"ok": True, "already_ending": True}
+        self._end_requested = True
+        return {"ok": True}
+
+    async def _end_after_speech(self):
+        """Ends the session after end_interview: waits for everything queued for
+        TTS to be generated, sent to the client and played, then closes."""
+        self._closing = True
+        self._set_end_reason("completed")
+        logger.info("end_interview called; closing after the closing line.")
+
+        async def wait(what: str, awaitable):
+            try:
+                await asyncio.wait_for(awaitable, timeout=DEFAULT_GOODBYE_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning("Timed out waiting for %s before ending the interview.", what)
+
+        async def until(condition):
+            while not condition():
+                await asyncio.sleep(0.02)
+
+        await wait("text to reach Deepgram", self.tts_text_queue.join())
+        await wait("Deepgram's closing audio", until(lambda: self._tts_flushes_received >= self._tts_flushes_sent))
+        await wait("closing audio to reach the client", self.audio_out_queue.join())
+        await wait("the client's playback", until(lambda: self._playback_acked_through >= self._utterance_ends_sent))
+        self._session_end_event.set()
+
     async def _purge_pipeline(self):
         """Drains in-flight queues instantly during a user barge-in and
         tells the browser to drop whatever it has already buffered."""
@@ -752,10 +898,12 @@ class CustomVoiceAgent:
                     break
                 
         self.is_ai_speaking = False
+        self._nudge_playing = False
         self.interruption_event.clear()
         await self._send_client({"control": "clear_speaker_buffer"})
         if self._dg_tts_ws is not None:
             try:
+                self._flushes_sent_at_clear = self._tts_flushes_sent
                 await self._dg_tts_ws.send(json.dumps({"type": "Clear"}))
             except Exception:
                 pass
@@ -791,7 +939,7 @@ class CustomVoiceAgent:
 
     def _end_turn_span(self, attributes: dict | None = None):
         if self._current_turn_span:
-            for key, value in (attributes or {}).items():
+            for key, value in self._traced(attributes or {}).items():
                 self._current_turn_span.set_attribute(key, value)
             self._current_turn_span.end()
             self._current_turn_span = None
@@ -800,17 +948,17 @@ class CustomVoiceAgent:
         return [{"role": "system", "content": self.system_prompt}] + self.conversation_history
 
     async def _finish_turn(self, user: str, assistant: str | None, interrupted: bool):
-        """Advances the turn counter and sends the turn record to the client."""
+        """Advances the turn counter, records the turn and sends it to the client."""
         self.turn_counter += 1
-        await self._send_client({
-            "turn": {
-                "turn_id": self.turn_counter,
-                "timestamp": time.time(),
-                "user": user,
-                "assistant": assistant,
-                "interrupted": interrupted,
-            }
-        })
+        record = {
+            "turn_id": self.turn_counter,
+            "timestamp": time.time(),
+            "user": user,
+            "assistant": assistant,
+            "interrupted": interrupted,
+        }
+        self.turns.append(record)
+        await self._send_client({"turn": dict(record)})
 
     def _in_turn(self):
         """Makes the current turn span the parent of spans started inside it."""
@@ -823,12 +971,30 @@ class CustomVoiceAgent:
         (or, with require_turn, when no turn span is open)."""
         if self.tracer is None or (require_turn and self._current_turn_span is None):
             return contextlib.nullcontext()
-        return self.tracer.start_as_current_span(name, attributes=attributes)
+        return self.tracer.start_as_current_span(name, attributes=self._traced(attributes))
 
     def _record_span(self, name: str, start_time: int, attributes: dict):
         """Records a span that started at start_time and ends now."""
         if self.tracer:
-            self.tracer.start_span(name, start_time=start_time, attributes=attributes).end()
+            self.tracer.start_span(name, start_time=start_time, attributes=self._traced(attributes)).end()
+
+    def _traced(self, attributes: dict) -> dict:
+        """The attributes to record: without the conversation text when trace_content is off."""
+        if self.trace_content:
+            return attributes
+        return {k: v for k, v in attributes.items() if k not in CONTENT_SPAN_ATTRIBUTES}
+
+    def _set_span_attribute(self, span, key: str, value):
+        if self.trace_content or key not in CONTENT_SPAN_ATTRIBUTES:
+            span.set_attribute(key, value)
+
+    def _record_span_exception(self, span, error: BaseException):
+        """Records an exception; with trace_content off, only its type, since
+        the message can quote the conversation."""
+        if self.trace_content:
+            span.record_exception(error)
+        else:
+            span.add_event("exception", {"exception.type": type(error).__qualname__})
 
     async def _speak_guardrail_block(self):
         self.is_ai_speaking = True
@@ -843,7 +1009,7 @@ class CustomVoiceAgent:
         impl = self.tool_registry.lookup(name)
         if impl is None:
             return {"error": f"unknown tool: {name}"}
-        serialized_args = json.dumps(args, default=str) if self.tracer else ""
+        serialized_args = json.dumps(args, default=str) if self.tracer and self.trace_content else ""
         with self._span("tool_call", {
             "tool.name": name,
             "tool.args": serialized_args,
@@ -852,7 +1018,7 @@ class CustomVoiceAgent:
         }) as span:
             try:
                 result = await impl(**args)
-                if span:
+                if span and self.trace_content:
                     serialized_result = json.dumps(result, default=str)[:TRACE_TEXT_MAX_CHARS]
                     span.set_attribute("tool.result", serialized_result)
                     span.set_attribute("output.value", serialized_result)
@@ -863,7 +1029,7 @@ class CustomVoiceAgent:
                 raise
             except Exception as e:
                 if span:
-                    span.record_exception(e)
+                    self._record_span_exception(span, e)
                     mark_span_error(span)
                 return {"error": str(e)}
 
@@ -923,10 +1089,12 @@ class CustomVoiceAgent:
 
 
     async def _execute_tool_hop(self, tool_call_accumulator: dict[int, dict]) -> bool:
-        self.is_ai_speaking = True
-        await self._speak(random.choice(TOOL_FILLER_PHRASES))
-
         entries = list(tool_call_accumulator.values())
+
+        # Ending the interview is instant, and the closing line was already spoken.
+        if any(entry["name"] != END_INTERVIEW_TOOL_NAME for entry in entries):
+            self.is_ai_speaking = True
+            await self._speak(random.choice(TOOL_FILLER_PHRASES))
 
         assistant_tool_calls = [
             {
@@ -1015,10 +1183,19 @@ async def run_voice_session(
     eval_run_id: str | None = None,
     eval_case_id: str | None = None,
     eval_variant: str | None = None,
+    stt_privacy_opt_out: bool = False,
+    inactivity_prompt_seconds: float | None = None,
+    inactivity_prompt_message: str = INACTIVITY_PROMPT_MESSAGE,
+    trace_content: bool = True,
+    end_interview_tool: bool = False,
     **kwargs
-):  
+) -> SessionResult:
+    """Runs one voice session on an accepted WebSocket and returns its
+    SessionResult once it ends. Errors are logged and reported as
+    `end_reason="error"`; only cancellation is raised."""
     if kwargs:
-        logger.warning("run_voice_session: ignoring unsupported options: %s", ", ".join(sorted(kwargs)))  
+        logger.warning("run_voice_session: ignoring unsupported options: %s", ", ".join(sorted(kwargs)))
+    agent: CustomVoiceAgent | None = None
     try:
         agent = CustomVoiceAgent(
             client_websocket=websocket,
@@ -1048,13 +1225,26 @@ async def run_voice_session(
             eval_run_id=eval_run_id,
             eval_case_id=eval_case_id,
             eval_variant=eval_variant,
+            stt_privacy_opt_out=stt_privacy_opt_out,
+            inactivity_prompt_seconds=inactivity_prompt_seconds,
+            inactivity_prompt_message=inactivity_prompt_message,
+            trace_content=trace_content,
+            end_interview_tool=end_interview_tool,
         )
-        await agent.run()
+        return await agent.run()
     except asyncio.CancelledError:
-        raise    
+        raise
     except Exception:
         logger.exception("Voice session failed for session_id=%s", session_id)
         try:
             await websocket.close(code=1011, reason="Session error")
         except Exception:
             pass
+        now = time.time()
+        return SessionResult(
+            turns=list(agent.turns) if agent is not None else [],
+            end_reason="error",
+            started_at=now,
+            ended_at=now,
+            duration_seconds=0.0,
+        )

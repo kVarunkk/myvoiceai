@@ -23,6 +23,13 @@ class ToolRegistry:
     def has(self, name: str) -> bool:
         return name in self._impls
 
+    def copy(self) -> "ToolRegistry":
+        """A new registry with the same tools; registering on it leaves this one unchanged."""
+        other = ToolRegistry()
+        other._impls = dict(self._impls)
+        other._schemas = list(self._schemas)
+        return other
+
 
 _default_registry = ToolRegistry()
 

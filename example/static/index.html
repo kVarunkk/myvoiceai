@@ -8,12 +8,31 @@
 
 <body style="background:#111; color:#fff; font-family:sans-serif; text-align:center; padding-top:10vh;">
     <h1>Live Voice Agent Engine</h1>
+    <div id="options" style="margin-bottom:20px; line-height:2;">
+        <label>Scenario
+            <select id="scenario">
+                <option value="interview">Interview (end_interview tool)</option>
+                <option value="travel">Travel (lookup_flight only)</option>
+            </select>
+        </label>
+        &nbsp;
+        <label><input type="checkbox" id="traceContent" checked> trace_content</label>
+        &nbsp;
+        <label><input type="checkbox" id="privacy"> stt_privacy_opt_out</label>
+        <br>
+        <label>Nudge after <input type="number" id="nudgeSeconds" value="8" min="0" style="width:50px">s</label>
+        &nbsp;
+        <label>Close after <input type="number" id="idleSeconds" value="20" min="1" style="width:50px">s idle</label>
+        &nbsp;
+        <label>Time limit <input type="number" id="maxSeconds" placeholder="default" min="1" style="width:70px">s</label>
+    </div>
     <button id="startBtn" style="padding:15px 30px; font-size:18px; cursor:pointer;">Start Connection</button>
     <p id="status">Status: Disconnected</p>
     <button id="stopBtn" style="padding:10px 20px; font-size:16px; cursor:pointer; display:none;">Stop
         Conversation</button>
     <div id="transcript" style="max-width:600px; margin:30px auto; text-align:left; max-height:60vh; overflow-y:auto;">
     </div>
+    <pre id="result" style="max-width:600px; margin:0 auto; text-align:left; white-space:pre-wrap; color:#9f9;"></pre>
 
     <script>
         const TARGET_SAMPLE_RATE = 16000;
@@ -21,6 +40,55 @@
         let utteranceEnded = false;
 
         let ws;
+        let sessionId = null;
+
+        function sessionUrl() {
+            const params = new URLSearchParams({
+                scenario: document.getElementById('scenario').value,
+                trace_content: document.getElementById('traceContent').checked ? '1' : '0',
+                privacy: document.getElementById('privacy').checked ? '1' : '0',
+                nudge_seconds: document.getElementById('nudgeSeconds').value || '0',
+                idle_seconds: document.getElementById('idleSeconds').value || '20',
+            });
+            const maxSeconds = document.getElementById('maxSeconds').value;
+            if (maxSeconds) params.set('max_seconds', maxSeconds);
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            return `${wsProtocol}://${window.location.host}/ws/voice?${params}`;
+        }
+
+        /*
+         * run_voice_session returns a few seconds after the socket closes
+         * (it flushes the trace spans first). Until then the server answers
+         * 202, so keep asking for up to a minute.
+         */
+        async function showSessionResult(id) {
+            const resultEl = document.getElementById('result');
+            const startedWaiting = Date.now();
+            while (Date.now() - startedWaiting < 60000) {
+                const res = await fetch(`/sessions/${id}`);
+                if (res.status === 202) {
+                    resultEl.textContent =
+                        `Session ${id} is finishing (flushing traces)... ${Math.round((Date.now() - startedWaiting) / 1000)}s`;
+                } else if (res.status === 404) {
+                    resultEl.textContent =
+                        `The server doesn't know session ${id}. Did it restart (reload=True)?`;
+                    return;
+                } else if (res.ok) {
+                    const result = await res.json();
+                    const registry = await (await fetch('/registry')).json();
+                    resultEl.textContent =
+                        `end_reason: ${result.end_reason}\n` +
+                        `duration: ${result.duration_seconds.toFixed(1)}s\n` +
+                        `turns: ${result.turns.length}\n` +
+                        `shared registry tools: ${registry.tools.join(', ')}\n\n` +
+                        JSON.stringify(result.turns, null, 2);
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            resultEl.textContent =
+                `Session ${id} still hadn't returned after 60s. Check the server log: the session may be stuck.`;
+        }
 
         let captureCtx;
         let playbackCtx;
@@ -106,14 +174,11 @@
                     nextPlaybackTime =
                         playbackCtx.currentTime;
 
-                    const wsProtocol =
-                        window.location.protocol === 'https:'
-                            ? 'wss'
-                            : 'ws';
+                    sessionId = null;
+                    document.getElementById('transcript').innerHTML = '';
+                    document.getElementById('result').textContent = '';
 
-                    ws = new WebSocket(
-                        `${wsProtocol}://${window.location.host}/ws/voice`
-                    );
+                    ws = new WebSocket(sessionUrl());
 
                     ws.binaryType = 'arraybuffer';
 
@@ -146,11 +211,20 @@
                             "Status: Connection error.";
                     };
 
-                    ws.onclose = () => {
+                    ws.onclose = (event) => {
+                        // Release the mic and audio if the server closed the session.
+                        if (ws) {
+                            document.getElementById('stopBtn').click();
+                        }
+
                         document.getElementById(
                             'status'
                         ).innerText =
-                            "Status: Disconnected.";
+                            `Status: Disconnected (code ${event.code}${event.reason ? `, ${event.reason}` : ''}).`;
+
+                        if (sessionId) {
+                            showSessionResult(sessionId);
+                        }
                     };
 
                     ws.onmessage = async (event) => {
@@ -163,6 +237,10 @@
                             const signal =
                                 JSON.parse(event.data);
 
+                            if (signal.session) {
+                                sessionId = signal.session.id;
+                                console.log("Session id:", sessionId);
+                            }
 
                             if (signal.control === "clear_speaker_buffer") {
                                 nextPlaybackTime =

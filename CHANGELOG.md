@@ -2,6 +2,22 @@
 
 Notable changes to `myvoiceai` are documented here by release. Versions 0.0.4 and later correspond to repository release tags.
 
+## [0.0.11]
+
+### Added
+
+- `run_voice_session()` returns a `SessionResult` with the session's turns, its `end_reason` (`completed`, `time_limit`, `inactivity`, `client_disconnect` or `error`), start and end times and duration. Errors are returned as `end_reason="error"` with the partial turns instead of being raised. Callers that ignore the return value are unaffected.
+- `end_interview_tool`: gives the model an `end_interview` tool. After the closing line has been generated, sent and played, the session closes with code 1000 and `end_reason="completed"`. No filler phrase is spoken for it, and a second call is a no-op.
+- `inactivity_prompt_seconds` and `inactivity_prompt_message`: one spoken nudge per silence before the inactivity close. The nudge's own playback doesn't restart the silence timer.
+- `trace_content`: with `False`, spans leave out transcripts, replies, tool arguments and results and guardrail matches, and exceptions are recorded by type only.
+- `stt_privacy_opt_out`: adds Deepgram's Model Improvement Program opt-out (`mip_opt_out=true`) to the STT connection.
+- `ToolRegistry.copy()`.
+
+### Changed
+
+- The session timer no longer acts while a session is already closing.
+- The client WebSocket is closed with an explicit code 1000 on cleanup (the previous default).
+
 ## [0.0.10]
 
 ### Fixed

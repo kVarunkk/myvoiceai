@@ -86,8 +86,28 @@ The example reads `GEMINI_API_KEY` and `DEEPGRAM_API_KEY` from environment varia
 | `eval_run_id` | Optional evaluation-run identifier attached to each turn span | `None` |
 | `eval_case_id` | Optional evaluation-case identifier attached to each turn span | `None` |
 | `eval_variant` | Optional prompt/model variant label attached to each turn span | `None` |
+| `inactivity_prompt_seconds` | Seconds of silence before one spoken nudge; the session still closes at `inactivity_timeout_seconds` | `None` (no nudge) |
+| `inactivity_prompt_message` | The nudge's text | `Take your time; let me know when you're ready.` |
+| `end_interview_tool` | Give the model an `end_interview` tool that closes the session after its closing line | `False` |
+| `trace_content` | Record conversation text (transcripts, replies, tool arguments and results) on spans | `True` |
+| `stt_privacy_opt_out` | Add Deepgram's Model Improvement Program opt-out (`mip_opt_out=true`) to the STT connection | `False` |
 
 `max_duration_message` and `inactivity_message` are also accepted by `run_voice_session()`. Unsupported extra keyword arguments are logged and ignored.
+
+## Session result
+
+`run_voice_session()` returns a `SessionResult` when the session ends:
+
+| Field | Meaning |
+| --- | --- |
+| `turns` | Each turn record exactly as sent to the client: `turn_id`, `timestamp`, `user`, `assistant`, `interrupted` |
+| `end_reason` | `completed` (the model called `end_interview`), `time_limit`, `inactivity`, `client_disconnect` or `error` |
+| `started_at`, `ended_at` | Unix timestamps in seconds |
+| `duration_seconds` | How long the session ran |
+
+Errors are reported as `end_reason="error"` with the turns so far, not raised; only cancellation propagates. Callers that ignore the return value are unaffected.
+
+With `end_interview_tool=True`, the model is given an `end_interview` tool. After it speaks its closing line and calls the tool, the session waits for that audio to be generated, sent and played by the client (each step bounded by a timeout), then closes the WebSocket with code 1000. Tell the model in the system prompt when to call it.
 
 `CustomVoiceAgent` is the lower-level class used by `run_voice_session()`. Prefer the function for normal application integration; direct class construction requires the full constructor argument set.
 
@@ -184,7 +204,7 @@ await run_voice_session(
 
 Each configuration must include an `endpoint` and may include `headers`. The package creates and manages the OTLP exporters internally, so application code does not need to import OpenTelemetry exporters. The `myvoiceai[observability]` extra is still required in the environment where tracing runs.
 
-Agent spans include OpenInference semantic attributes (`openinference.span.kind`, `input.value`, and `output.value` where applicable) so Arize can classify span types and display inputs/outputs. These attributes may contain conversation or tool data; review the data before exporting it to a tracing backend.
+Agent spans include OpenInference semantic attributes (`openinference.span.kind`, `input.value`, and `output.value` where applicable) so Arize can classify span types and display inputs/outputs. These attributes may contain conversation or tool data; review the data before exporting it to a tracing backend. Pass `trace_content=False` to leave them out: spans keep their names, timing and non-text attributes, and exceptions are recorded by type only.
 
 `service_name` and `project_name` are resource attributes shared by all spans from a session. Set them to stable application and project identifiers to group traces consistently across sessions. `project_name` is distinct from Arize's Space ID, which remains an exporter header.
 
