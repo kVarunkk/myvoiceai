@@ -10,6 +10,9 @@ DEEPGRAM_STT_URL = (
     "&utterance_end_ms={utterance_end}"
 )
 
+# Deepgram's Model Improvement Program opt-out: the audio isn't kept for training.
+DEEPGRAM_MIP_OPT_OUT_PARAM = "&mip_opt_out=true"
+
 DEEPGRAM_TTS_URL = (
     "wss://api.deepgram.com/v1/speak"
     "?encoding=linear16&sample_rate=16000&model={tts_model}"
@@ -57,3 +60,19 @@ STABLE_DISPATCH_DEDUP_SECS = 5  # window for dropping words already sent via a s
 FILLERS = {"and", "uh", "um", "so", "but", "or", "the", "a", "like"}
 
 TRACE_TEXT_MAX_CHARS = 500  # longest text recorded on a span attribute
+INACTIVITY_PROMPT_MESSAGE = "Take your time; let me know when you're ready."
+
+END_INTERVIEW_TOOL_NAME = "end_interview"
+END_INTERVIEW_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": END_INTERVIEW_TOOL_NAME,
+        "description": (
+            "Ends the interview and closes the session. Call it only after you "
+            "have spoken your closing line; say nothing after calling it."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+# Spoken when the model ends the interview without a closing line of its own.
+END_INTERVIEW_FALLBACK_MESSAGE = "Thank you for your time. Goodbye."
